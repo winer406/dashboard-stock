@@ -4,7 +4,7 @@
 功能：
 1. 輸入台股代碼與查詢天數
 2. 技術指標：布林通道、5/20/60/120 日均線、KD、RSI、MACD
-3. K線形態偵測：Morning Star, Evening Star, Shooting Star
+3. K線形態偵測：Morning Star, Evening Star, Shooting Star 與多種吞噬/母子型態
 4. 自動處理 Yahoo Finance 資料結構
 5. 可切換 ChatGPT / Gemini 分析 K 線圖、成交量與布林通道
 
@@ -40,6 +40,21 @@ GEMINI_API_URL_TEMPLATE = (
 )
 DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
 ENV_QUOTES = "\"'“”‘’"
+PATTERN_SELECT_ALL = "全選"
+PATTERN_CHOICES = (
+    PATTERN_SELECT_ALL,
+    "Morning Star (晨星)",
+    "Evening Star (暮星)",
+    "Shooting Star (射擊之星)",
+    "Bullish Engulfing (多頭吞噬)",
+    "Hammer (槌子)",
+    "Hanging Man (吊人線)",
+    "Meteor (流星)",
+    "Bullish Harami (多頭母子)",
+    "Bullish Harami Cross (多頭母子十字)",
+    "Bearish Harami (空頭母子)",
+    "Bearish Engulfing (陰吞噬)",
+)
 
 @dataclass
 class ChartOptions:
@@ -53,6 +68,18 @@ class ChartOptions:
     show_morning_star: bool
     show_evening_star: bool
     show_shooting_star: bool
+    show_bullish_engulfing: bool
+    show_hammer: bool
+    show_hanging_man: bool
+    show_meteor: bool
+    show_bullish_harami: bool
+    show_bullish_harami_cross: bool
+    show_bearish_harami: bool
+    show_bearish_engulfing: bool
+    show_bullish_harami: bool
+    show_bullish_harami_cross: bool
+    show_bearish_harami: bool
+    show_bearish_engulfing: bool
 
 # -----------------------------
 # 形態偵測函式
@@ -105,13 +132,136 @@ def detect_shooting_star(data: pd.DataFrame) -> pd.Series:
         signals.iloc[i] = is_shooting
     return signals
 
+def detect_bullish_engulfing(data: pd.DataFrame) -> pd.Series:
+    """多頭吞噬：前黑後紅，且後一根實體吞噬前一根實體"""
+    signals = pd.Series(False, index=data.index)
+    for i in range(1, len(data)):
+        prev, curr = data.iloc[i - 1], data.iloc[i]
+        prev_bearish = prev["Close"] < prev["Open"]
+        curr_bullish = curr["Close"] > curr["Open"]
+        engulfs_body = curr["Open"] <= prev["Close"] and curr["Close"] >= prev["Open"]
+        signals.iloc[i] = prev_bearish and curr_bullish and engulfs_body
+    return signals
+
+def detect_bearish_engulfing(data: pd.DataFrame) -> pd.Series:
+    """陰吞噬：前紅後黑，且後一根黑 K 實體吞噬前一根紅 K 實體"""
+    signals = pd.Series(False, index=data.index)
+    for i in range(1, len(data)):
+        prev, curr = data.iloc[i - 1], data.iloc[i]
+        prev_bullish = prev["Close"] > prev["Open"]
+        curr_bearish = curr["Close"] < curr["Open"]
+        engulfs_body = curr["Open"] >= prev["Close"] and curr["Close"] <= prev["Open"]
+        signals.iloc[i] = prev_bullish and curr_bearish and engulfs_body
+    return signals
+
+def is_body_inside_previous(prev: pd.Series, curr: pd.Series) -> bool:
+    prev_body_low = min(prev["Open"], prev["Close"])
+    prev_body_high = max(prev["Open"], prev["Close"])
+    curr_body_low = min(curr["Open"], curr["Close"])
+    curr_body_high = max(curr["Open"], curr["Close"])
+    return curr_body_low >= prev_body_low and curr_body_high <= prev_body_high
+
+def detect_bullish_harami(data: pd.DataFrame) -> pd.Series:
+    """多頭母子：前長黑、後小紅，且後一根實體落在前一根實體內"""
+    signals = pd.Series(False, index=data.index)
+    for i in range(1, len(data)):
+        prev, curr = data.iloc[i - 1], data.iloc[i]
+        prev_body = abs(prev["Close"] - prev["Open"])
+        curr_body = abs(curr["Close"] - curr["Open"])
+        prev_range = max(prev["High"] - prev["Low"], 0.001)
+        is_signal = (
+            prev["Close"] < prev["Open"]
+            and curr["Close"] > curr["Open"]
+            and prev_body >= prev_range * 0.45
+            and curr_body <= prev_body * 0.55
+            and is_body_inside_previous(prev, curr)
+        )
+        signals.iloc[i] = is_signal
+    return signals
+
+def detect_bullish_harami_cross(data: pd.DataFrame) -> pd.Series:
+    """多頭母子十字：前長黑、後十字線，且十字實體落在前一根實體內"""
+    signals = pd.Series(False, index=data.index)
+    for i in range(1, len(data)):
+        prev, curr = data.iloc[i - 1], data.iloc[i]
+        prev_body = abs(prev["Close"] - prev["Open"])
+        curr_body = abs(curr["Close"] - curr["Open"])
+        curr_range = max(curr["High"] - curr["Low"], 0.001)
+        prev_range = max(prev["High"] - prev["Low"], 0.001)
+        is_doji = curr_body <= curr_range * 0.12 or curr_body <= prev_body * 0.12
+        is_signal = (
+            prev["Close"] < prev["Open"]
+            and prev_body >= prev_range * 0.45
+            and is_doji
+            and is_body_inside_previous(prev, curr)
+        )
+        signals.iloc[i] = is_signal
+    return signals
+
+def detect_bearish_harami(data: pd.DataFrame) -> pd.Series:
+    """空頭母子：前長紅、後小黑，且後一根實體落在前一根實體內"""
+    signals = pd.Series(False, index=data.index)
+    for i in range(1, len(data)):
+        prev, curr = data.iloc[i - 1], data.iloc[i]
+        prev_body = abs(prev["Close"] - prev["Open"])
+        curr_body = abs(curr["Close"] - curr["Open"])
+        prev_range = max(prev["High"] - prev["Low"], 0.001)
+        is_signal = (
+            prev["Close"] > prev["Open"]
+            and curr["Close"] < curr["Open"]
+            and prev_body >= prev_range * 0.45
+            and curr_body <= prev_body * 0.55
+            and is_body_inside_previous(prev, curr)
+        )
+        signals.iloc[i] = is_signal
+    return signals
+
+def detect_lower_shadow_candle(data: pd.DataFrame) -> pd.Series:
+    """小實體、長下影線、上影線短的單根 K 線外型"""
+    signals = pd.Series(False, index=data.index)
+    for i in range(len(data)):
+        curr = data.iloc[i]
+        body = abs(curr["Close"] - curr["Open"])
+        total_range = max(curr["High"] - curr["Low"], 0.001)
+        upper_shadow = curr["High"] - max(curr["Open"], curr["Close"])
+        lower_shadow = min(curr["Open"], curr["Close"]) - curr["Low"]
+
+        is_lower_shadow_candle = (
+            body <= total_range * 0.35
+            and lower_shadow >= body * 2
+            and upper_shadow <= total_range * 0.25
+        )
+        signals.iloc[i] = is_lower_shadow_candle
+    return signals
+
+def detect_hammer(data: pd.DataFrame) -> pd.Series:
+    """槌子：短線下跌後出現小實體、長下影線，偏看漲反轉"""
+    signals = detect_lower_shadow_candle(data)
+    trend_filter = data["Close"] < data["Close"].rolling(5).mean()
+    return signals & trend_filter.fillna(False)
+
+def detect_hanging_man(data: pd.DataFrame) -> pd.Series:
+    """吊人線：形態接近槌子，但通常出現在短線上漲後，偏看跌警訊"""
+    signals = detect_lower_shadow_candle(data)
+    trend_filter = data["Close"] > data["Close"].rolling(5).mean()
+    return signals & trend_filter.fillna(False)
+
+def detect_meteor(data: pd.DataFrame) -> pd.Series:
+    """流星：小實體、長上影線、下影線短，偏看跌警訊"""
+    return detect_shooting_star(data)
+
 # -----------------------------
 # 資料處理
 # -----------------------------
 def normalize_ticker(stock_id: str) -> str:
     ticker = stock_id.strip().upper()
     if not ticker: raise ValueError("請輸入代碼")
+    if ticker.endswith(".IO"):
+        return f"{ticker[:-3]}.TWO"
     return f"{ticker}.TW" if "." not in ticker else ticker
+
+def is_pattern_selected(selected_patterns: list[str], pattern_name: str) -> bool:
+    return PATTERN_SELECT_ALL in selected_patterns or pattern_name in selected_patterns
 
 def calculate_rsi(close: pd.Series, window: int = RSI_WINDOW) -> pd.Series:
     delta = close.diff()
@@ -156,6 +306,14 @@ def get_stock_data(options: ChartOptions) -> pd.DataFrame:
     data["Morning Star"] = detect_morning_star(data)
     data["Evening Star"] = detect_evening_star(data)
     data["Shooting Star"] = detect_shooting_star(data)
+    data["Bullish Engulfing"] = detect_bullish_engulfing(data)
+    data["Hammer"] = detect_hammer(data)
+    data["Hanging Man"] = detect_hanging_man(data)
+    data["Meteor"] = detect_meteor(data)
+    data["Bullish Harami"] = detect_bullish_harami(data)
+    data["Bullish Harami Cross"] = detect_bullish_harami_cross(data)
+    data["Bearish Harami"] = detect_bearish_harami(data)
+    data["Bearish Engulfing"] = detect_bearish_engulfing(data)
 
     return data.tail(options.display_days)
 
@@ -227,6 +385,34 @@ def draw_chart(data: pd.DataFrame, options: ChartOptions):
                     x=sigs.index, y=sigs[pos] * offset, mode="markers",
                     marker=dict(color=color, size=12, symbol=symbol), name=col
                 ), row=1, col=1)
+
+    label_pattern_configs = [
+        (options.show_bullish_engulfing, "Bullish Engulfing", "多頭吞噬", "Low", 0.965, "red", "white", "top"),
+        (options.show_hammer, "Hammer", "槌子", "Low", 0.955, "red", "white", "top"),
+        (options.show_hanging_man, "Hanging Man", "吊人線", "High", 1.045, "green", "black", "bottom"),
+        (options.show_meteor, "Meteor", "流星", "High", 1.035, "green", "black", "bottom"),
+        (options.show_bullish_harami, "Bullish Harami", "多頭母子", "Low", 0.945, "red", "white", "top"),
+        (options.show_bullish_harami_cross, "Bullish Harami Cross", "多頭母子十字", "Low", 0.935, "red", "white", "top"),
+        (options.show_bearish_harami, "Bearish Harami", "空頭母子", "High", 1.055, "green", "black", "bottom"),
+        (options.show_bearish_engulfing, "Bearish Engulfing", "陰吞噬", "High", 1.065, "green", "black", "bottom"),
+    ]
+    for show, col, label, pos, offset, bg_color, font_color, yanchor in label_pattern_configs:
+        if show:
+            sigs = data[data[col]]
+            for x_value, row in sigs.iterrows():
+                fig.add_annotation(
+                    x=x_value,
+                    y=row[pos] * offset,
+                    text=label,
+                    showarrow=False,
+                    bgcolor=bg_color,
+                    bordercolor=bg_color,
+                    borderpad=3,
+                    font=dict(color=font_color, size=11),
+                    yanchor=yanchor,
+                    xref="x",
+                    yref="y",
+                )
 
     # 成交量
     fig.add_trace(go.Bar(x=data.index, y=data["Volume"], marker_color=data["VolColor"], name="成交量"), row=2, col=1)
@@ -507,7 +693,12 @@ def main():
 
     with st.sidebar:
         st.header("設定")
-        sid = st.text_input("股票代碼", "2330")
+        sid = st.text_input(
+            "股票代碼",
+            "2330.TW",
+            help="上市請輸入 xxxx.TW，例如 2330.TW；上櫃請輸入 xxxx.TWO，例如 6208.TWO。",
+        )
+        st.caption("上市請輸入 xxxx.TW；上櫃請輸入 xxxx.TWO。")
         days = st.slider("查詢天數", 30, 365, 120)
         
         st.subheader("指標顯示")
@@ -523,9 +714,23 @@ def main():
         macd_on = st.checkbox("MACD", False)
         
         st.subheader("形態偵測")
-        ms_on = st.checkbox("Morning Star (晨星)", True)
-        es_on = st.checkbox("Evening Star (暮星)", True)
-        ss_on = st.checkbox("Shooting Star (射擊之星)", True)
+        selected_patterns = st.multiselect(
+            "K線型態",
+            options=list(PATTERN_CHOICES),
+            default=[PATTERN_SELECT_ALL],
+            help="選擇全選會顯示所有 K 線型態標記。",
+        )
+        ms_on = is_pattern_selected(selected_patterns, "Morning Star (晨星)")
+        es_on = is_pattern_selected(selected_patterns, "Evening Star (暮星)")
+        ss_on = is_pattern_selected(selected_patterns, "Shooting Star (射擊之星)")
+        be_on = is_pattern_selected(selected_patterns, "Bullish Engulfing (多頭吞噬)")
+        hammer_on = is_pattern_selected(selected_patterns, "Hammer (槌子)")
+        hanging_on = is_pattern_selected(selected_patterns, "Hanging Man (吊人線)")
+        meteor_on = is_pattern_selected(selected_patterns, "Meteor (流星)")
+        bullish_harami_on = is_pattern_selected(selected_patterns, "Bullish Harami (多頭母子)")
+        bullish_harami_cross_on = is_pattern_selected(selected_patterns, "Bullish Harami Cross (多頭母子十字)")
+        bearish_harami_on = is_pattern_selected(selected_patterns, "Bearish Harami (空頭母子)")
+        bearish_engulfing_on = is_pattern_selected(selected_patterns, "Bearish Engulfing (陰吞噬)")
 
         st.subheader("AI 分析")
         ai_provider = st.radio(
@@ -549,6 +754,14 @@ def main():
                 ms_on,
                 es_on,
                 ss_on,
+                be_on,
+                hammer_on,
+                hanging_on,
+                meteor_on,
+                bullish_harami_on,
+                bullish_harami_cross_on,
+                bearish_harami_on,
+                bearish_engulfing_on,
             )
             data = get_stock_data(opts)
             st.session_state["stock_data"] = data
@@ -578,6 +791,14 @@ def main():
             ("Morning Star", opts.show_morning_star),
             ("Evening Star", opts.show_evening_star),
             ("Shooting Star", opts.show_shooting_star),
+            ("Bullish Engulfing", opts.show_bullish_engulfing),
+            ("Hammer", opts.show_hammer),
+            ("Hanging Man", opts.show_hanging_man),
+            ("Meteor", opts.show_meteor),
+            ("Bullish Harami", opts.show_bullish_harami),
+            ("Bullish Harami Cross", opts.show_bullish_harami_cross),
+            ("Bearish Harami", opts.show_bearish_harami),
+            ("Bearish Engulfing", opts.show_bearish_engulfing),
         ]:
             if flag:
                 sigs = data[data[name]]
