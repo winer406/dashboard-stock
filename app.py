@@ -786,26 +786,6 @@ def main():
 
         st.plotly_chart(draw_chart(data, opts), use_container_width=True)
 
-        # 顯示訊號列表
-        for name, flag in [
-            ("Morning Star", opts.show_morning_star),
-            ("Evening Star", opts.show_evening_star),
-            ("Shooting Star", opts.show_shooting_star),
-            ("Bullish Engulfing", opts.show_bullish_engulfing),
-            ("Hammer", opts.show_hammer),
-            ("Hanging Man", opts.show_hanging_man),
-            ("Meteor", opts.show_meteor),
-            ("Bullish Harami", opts.show_bullish_harami),
-            ("Bullish Harami Cross", opts.show_bullish_harami_cross),
-            ("Bearish Harami", opts.show_bearish_harami),
-            ("Bearish Engulfing", opts.show_bearish_engulfing),
-        ]:
-            if flag:
-                sigs = data[data[name]]
-                if not sigs.empty:
-                    st.write(f"✅ 近期 {name} 訊號：")
-                    st.dataframe(sigs[["Open", "High", "Low", "Close", "Volume"]].sort_index(ascending=False))
-
         st.subheader("AI 分析說明")
         provider = ai_provider
         st.caption(f"目前使用 {provider} 分析 K 線、成交量、布林通道、均線、KD、RSI 與 MACD；內容僅供研究參考。")
