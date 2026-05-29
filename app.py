@@ -13,7 +13,9 @@ pip install streamlit yfinance pandas plotly
 """
 
 from dataclasses import dataclass
+import csv
 import datetime as dt
+import io
 import json
 import os
 import urllib.error
@@ -72,10 +74,6 @@ class ChartOptions:
     show_hammer: bool
     show_hanging_man: bool
     show_meteor: bool
-    show_bullish_harami: bool
-    show_bullish_harami_cross: bool
-    show_bearish_harami: bool
-    show_bearish_engulfing: bool
     show_bullish_harami: bool
     show_bullish_harami_cross: bool
     show_bearish_harami: bool
@@ -256,12 +254,133 @@ def detect_meteor(data: pd.DataFrame) -> pd.Series:
 def normalize_ticker(stock_id: str) -> str:
     ticker = stock_id.strip().upper()
     if not ticker: raise ValueError("請輸入代碼")
-    if ticker.endswith(".IO"):
-        return f"{ticker[:-3]}.TWO"
     return f"{ticker}.TW" if "." not in ticker else ticker
 
 def is_pattern_selected(selected_patterns: list[str], pattern_name: str) -> bool:
     return PATTERN_SELECT_ALL in selected_patterns or pattern_name in selected_patterns
+
+def get_stock_code_and_market(ticker: str) -> tuple[str, str]:
+    normalized = normalize_ticker(ticker)
+    stock_code = normalized.split(".")[0]
+    market = "TPEX" if normalized.endswith(".TWO") else "TWSE"
+    return stock_code, market
+
+def parse_int(value) -> int:
+    if value is None or pd.isna(value):
+        return 0
+    cleaned = str(value).replace(",", "").replace("--", "0").strip()
+    if cleaned in ("", "-"):
+        return 0
+    try:
+        return int(float(cleaned))
+    except ValueError:
+        return 0
+
+def format_roc_date(date_value: dt.date) -> str:
+    return f"{date_value.year - 1911}/{date_value.month:02d}/{date_value.day:02d}"
+
+def get_column_value(row: dict, contains: str, exclude: tuple[str, ...] = ()) -> int:
+    for key, value in row.items():
+        normalized_key = str(key).replace(" ", "")
+        if contains in normalized_key and all(item not in normalized_key for item in exclude):
+            return parse_int(value)
+    return 0
+
+def fetch_json(url: str) -> dict:
+    request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(request, timeout=20) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+def fetch_text(url: str) -> str:
+    request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(request, timeout=20) as response:
+        content = response.read()
+    for encoding in ("utf-8-sig", "big5", "cp950"):
+        try:
+            return content.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return content.decode("utf-8", errors="replace")
+
+def fetch_twse_institutional_trade(stock_code: str, trade_date: dt.date) -> dict | None:
+    url = (
+        "https://www.twse.com.tw/rwd/zh/fund/T86"
+        f"?date={trade_date.strftime('%Y%m%d')}&selectType=ALLBUT0999&response=json"
+    )
+    payload = fetch_json(url)
+    columns = payload.get("fields") or payload.get("columns") or []
+    rows = payload.get("data") or []
+    for values in rows:
+        row = dict(zip(columns, values))
+        if str(row.get("證券代號", "")).strip() == stock_code:
+            foreign = get_column_value(row, "外陸資買賣超股數", ("自營商",))
+            investment = get_column_value(row, "投信買賣超股數")
+            dealer = get_column_value(row, "自營商買賣超股數")
+            total = get_column_value(row, "三大法人買賣超股數")
+            return {
+                "日期": trade_date.strftime("%Y-%m-%d"),
+                "外資買賣超": foreign,
+                "投信買賣超": investment,
+                "自營商買賣超": dealer,
+                "三大法人合計": total,
+            }
+    return None
+
+def fetch_tpex_institutional_trade(stock_code: str, trade_date: dt.date) -> dict | None:
+    url = (
+        "https://www.tpex.org.tw/web/stock/3insti/daily_trade/3itrade_hedge_result.php"
+        f"?l=zh-tw&o=csv&se=EW&t=D&d={format_roc_date(trade_date)}&s=0,asc"
+    )
+    csv_text = fetch_text(url)
+    reader = csv.reader(io.StringIO(csv_text))
+    for row in reader:
+        if len(row) < 2 or row[0].strip() != stock_code:
+            continue
+
+        values = [parse_int(value) for value in row[2:]]
+        if len(values) < 22:
+            return None
+
+        foreign = values[8]
+        investment = values[11]
+        dealer = values[20]
+        total = values[21]
+        return {
+            "日期": trade_date.strftime("%Y-%m-%d"),
+            "外資買賣超": foreign,
+            "投信買賣超": investment,
+            "自營商買賣超": dealer,
+            "三大法人合計": total,
+        }
+    return None
+
+@st.cache_data(ttl=3600)
+def get_institutional_trade_data(ticker: str, trading_days: int = 10) -> pd.DataFrame:
+    stock_code, market = get_stock_code_and_market(ticker)
+    records = []
+    today = dt.date.today()
+
+    for day_offset in range(0, 45):
+        if len(records) >= trading_days:
+            break
+
+        trade_date = today - dt.timedelta(days=day_offset)
+        try:
+            if market == "TPEX":
+                record = fetch_tpex_institutional_trade(stock_code, trade_date)
+            else:
+                record = fetch_twse_institutional_trade(stock_code, trade_date)
+        except Exception:
+            continue
+
+        if record:
+            records.append(record)
+
+    if not records:
+        return pd.DataFrame()
+
+    data = pd.DataFrame(records).sort_values("日期", ascending=False)
+    return data.reset_index(drop=True)
 
 def calculate_rsi(close: pd.Series, window: int = RSI_WINDOW) -> pd.Series:
     delta = close.diff()
@@ -325,6 +444,39 @@ def get_non_trading_days(data: pd.DataFrame) -> list[str]:
         for day in all_days
         if day.strftime("%Y-%m-%d") not in trading_days
     ]
+
+def draw_institutional_trade_chart(data: pd.DataFrame):
+    chart_data = data.sort_values("日期").copy()
+    fig = go.Figure()
+    colors = {
+        "外資買賣超": "#2563eb",
+        "投信買賣超": "#f97316",
+        "自營商買賣超": "#7c3aed",
+        "三大法人合計": "#111827",
+    }
+
+    for column, color in colors.items():
+        fig.add_trace(
+            go.Bar(
+                x=chart_data["日期"],
+                y=chart_data[column],
+                name=column,
+                marker_color=color,
+            )
+        )
+
+    fig.add_hline(y=0, line_color="#6b7280", line_width=1)
+    fig.update_layout(
+        height=360,
+        template="plotly_white",
+        barmode="group",
+        hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+        margin=dict(l=20, r=20, t=45, b=20),
+    )
+    fig.update_xaxes(title_text="日期")
+    fig.update_yaxes(title_text="買賣超股數", tickformat=",")
+    return fig
 
 def draw_chart(data: pd.DataFrame, options: ChartOptions):
     extra_panels = []
@@ -785,6 +937,17 @@ def main():
         c4.metric("成交量", f"{int(l['Volume']):,}")
 
         st.plotly_chart(draw_chart(data, opts), use_container_width=True)
+
+        st.subheader("近 10 個交易日三大法人買賣超")
+        st.caption("單位：股；正數為買超，負數為賣超。資料來源：TWSE / TPEx 公開資料。")
+        institutional_data = get_institutional_trade_data(opts.ticker)
+        if institutional_data.empty:
+            st.info("目前查無此個股近 10 個交易日三大法人資料，可能是資料來源尚未更新或代碼市場別不符。")
+        else:
+            st.plotly_chart(
+                draw_institutional_trade_chart(institutional_data),
+                use_container_width=True,
+            )
 
         st.subheader("AI 分析說明")
         provider = ai_provider
