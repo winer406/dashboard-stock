@@ -41,6 +41,7 @@ GEMINI_API_URL_TEMPLATE = (
     "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 )
 DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+TPEX_OPENAPI_BASE = "https://www.tpex.org.tw/openapi/v1"
 ENV_QUOTES = "\"'“”‘’"
 PATTERN_SELECT_ALL = "全選"
 PATTERN_CHOICES = (
@@ -279,14 +280,22 @@ def parse_int(value) -> int:
 def format_roc_date(date_value: dt.date) -> str:
     return f"{date_value.year - 1911}/{date_value.month:02d}/{date_value.day:02d}"
 
-def get_column_value(row: dict, contains: str, exclude: tuple[str, ...] = ()) -> int:
-    for key, value in row.items():
-        normalized_key = str(key).replace(" ", "")
-        if contains in normalized_key and all(item not in normalized_key for item in exclude):
-            return parse_int(value)
-    return 0
+def first_record_value(record: dict, names: list[str], fallback=0):
+    for name in names:
+        if name in record:
+            return record[name]
+    return fallback
 
-def fetch_json(url: str) -> dict:
+def format_twse_date(date_code: str) -> str:
+    digits = "".join(ch for ch in str(date_code) if ch.isdigit())
+    if len(digits) == 8:
+        return f"{digits[:4]}-{digits[4:6]}-{digits[6:]}"
+    if len(digits) == 7:
+        year = int(digits[:3]) + 1911
+        return f"{year}-{digits[3:5]}-{digits[5:]}"
+    return str(date_code)
+
+def fetch_json(url: str):
     request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     with urllib.request.urlopen(request, timeout=20) as response:
         return json.loads(response.read().decode("utf-8"))
@@ -313,12 +322,22 @@ def fetch_twse_institutional_trade(stock_code: str, trade_date: dt.date) -> dict
     for values in rows:
         row = dict(zip(columns, values))
         if str(row.get("證券代號", "")).strip() == stock_code:
-            foreign = get_column_value(row, "外陸資買賣超股數", ("自營商",))
-            investment = get_column_value(row, "投信買賣超股數")
-            dealer = get_column_value(row, "自營商買賣超股數")
-            total = get_column_value(row, "三大法人買賣超股數")
+            foreign = parse_int(
+                first_record_value(
+                    row,
+                    [
+                        "外陸資買賣超股數(不含外資自營商)",
+                        "外資買賣超股數(不含外資自營商)",
+                        "外陸資買賣超股數",
+                        "外資買賣超股數",
+                    ],
+                )
+            )
+            investment = parse_int(first_record_value(row, ["投信買賣超股數"]))
+            dealer = parse_int(first_record_value(row, ["自營商買賣超股數"]))
+            total = parse_int(first_record_value(row, ["三大法人買賣超股數"], foreign + investment + dealer))
             return {
-                "日期": trade_date.strftime("%Y-%m-%d"),
+                "日期": format_twse_date(payload.get("date") or trade_date.strftime("%Y%m%d")),
                 "外資買賣超": foreign,
                 "投信買賣超": investment,
                 "自營商買賣超": dealer,
@@ -326,25 +345,77 @@ def fetch_twse_institutional_trade(stock_code: str, trade_date: dt.date) -> dict
             }
     return None
 
+def parse_tpex_institutional_trade(row: dict) -> dict:
+    foreign = parse_int(
+        first_record_value(
+            row,
+            [
+                "ForeignInvestorsInclude MainlandAreaInvestors-Difference",
+                "Foreign Investors include Mainland Area Investors (Foreign Dealers excluded)-Difference",
+                "ForeignInvestorsExcludingForeignDealers-Difference",
+            ],
+        )
+    )
+    investment = parse_int(first_record_value(row, ["SecuritiesInvestmentTrustCompanies-Difference"]))
+    dealer = parse_int(first_record_value(row, ["Dealers-Difference"]))
+    total = parse_int(first_record_value(row, ["TotalDifference"], foreign + investment + dealer))
+    return {
+        "日期": format_twse_date(str(row.get("Date", ""))),
+        "外資買賣超": foreign,
+        "投信買賣超": investment,
+        "自營商買賣超": dealer,
+        "三大法人合計": total,
+    }
+
+def fetch_tpex_institutional_trades(stock_code: str, trading_days: int = 10) -> pd.DataFrame:
+    rows = fetch_json(f"{TPEX_OPENAPI_BASE}/tpex_3insti_daily_trading")
+    if not isinstance(rows, list):
+        return pd.DataFrame()
+
+    records = [
+        parse_tpex_institutional_trade(row)
+        for row in rows
+        if str(row.get("SecuritiesCompanyCode", "")).strip() == stock_code
+    ]
+    if not records:
+        return pd.DataFrame()
+
+    data = pd.DataFrame(records).sort_values("日期", ascending=False).head(trading_days)
+    return data.reset_index(drop=True)
+
 def fetch_tpex_institutional_trade(stock_code: str, trade_date: dt.date) -> dict | None:
-    url = (
+    csv_url = (
         "https://www.tpex.org.tw/web/stock/3insti/daily_trade/3itrade_hedge_result.php"
         f"?l=zh-tw&o=csv&se=EW&t=D&d={format_roc_date(trade_date)}&s=0,asc"
     )
-    csv_text = fetch_text(url)
-    reader = csv.reader(io.StringIO(csv_text))
-    for row in reader:
-        if len(row) < 2 or row[0].strip() != stock_code:
+    csv_text = fetch_text(csv_url)
+    lines = [
+        row
+        for row in csv.reader(io.StringIO(csv_text))
+        if row and not row[0].startswith("=")
+    ]
+    if not lines:
+        return None
+
+    headers = lines[0]
+    for values in lines[1:]:
+        row = dict(zip(headers, values))
+        if str(row.get("代號", row.get("證券代號", ""))).strip() != stock_code:
             continue
 
-        values = [parse_int(value) for value in row[2:]]
-        if len(values) < 22:
-            return None
-
-        foreign = values[8]
-        investment = values[11]
-        dealer = values[20]
-        total = values[21]
+        foreign = parse_int(
+            first_record_value(
+                row,
+                [
+                    "外資及陸資(不含外資自營商)-買賣超股數",
+                    "外資及陸資買賣超股數",
+                    "外資買賣超股數",
+                ],
+            )
+        )
+        investment = parse_int(first_record_value(row, ["投信買賣超股數"]))
+        dealer = parse_int(first_record_value(row, ["自營商買賣超股數"]))
+        total = parse_int(first_record_value(row, ["三大法人買賣超股數"], foreign + investment + dealer))
         return {
             "日期": trade_date.strftime("%Y-%m-%d"),
             "外資買賣超": foreign,
@@ -357,6 +428,11 @@ def fetch_tpex_institutional_trade(stock_code: str, trade_date: dt.date) -> dict
 @st.cache_data(ttl=3600)
 def get_institutional_trade_data(ticker: str, trading_days: int = 10) -> pd.DataFrame:
     stock_code, market = get_stock_code_and_market(ticker)
+    if market == "TPEX":
+        tpex_data = fetch_tpex_institutional_trades(stock_code, trading_days)
+        if not tpex_data.empty:
+            return tpex_data
+
     records = []
     today = dt.date.today()
 
@@ -948,6 +1024,10 @@ def main():
                 draw_institutional_trade_chart(institutional_data),
                 use_container_width=True,
             )
+            display_data = institutional_data.copy()
+            for column in ["外資買賣超", "投信買賣超", "自營商買賣超", "三大法人合計"]:
+                display_data[column] = display_data[column].map(lambda value: f"{value:,}")
+            st.dataframe(display_data, use_container_width=True, hide_index=True)
 
         st.subheader("AI 分析說明")
         provider = ai_provider
