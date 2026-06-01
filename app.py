@@ -18,8 +18,11 @@ import datetime as dt
 import io
 import json
 import os
+import ssl
 import urllib.error
+import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -43,6 +46,10 @@ GEMINI_API_URL_TEMPLATE = (
 DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
 TPEX_OPENAPI_BASE = "https://www.tpex.org.tw/openapi/v1"
 ENV_QUOTES = "\"'“”‘’"
+KGI_SERVICE_URL = "https://warrant.kgi.com/EDWebService/WSInterfaceSwap.asmx/GetService"
+KGI_LOCATION_PATH = "/EDWebSite/Views/WarrantCalculator/WarrantCalculator.aspx"
+KGI_USER_AGENT = "Mozilla/5.0"
+KGI_NS = {"t": "http://tempuri.org/"}
 PATTERN_SELECT_ALL = "全選"
 PATTERN_CHOICES = (
     PATTERN_SELECT_ALL,
@@ -79,6 +86,15 @@ class ChartOptions:
     show_bullish_harami_cross: bool
     show_bearish_harami: bool
     show_bearish_engulfing: bool
+
+
+def safe_float(value, default: float = 0.0) -> float:
+    if value in ("", None):
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 # -----------------------------
 # 形態偵測函式
@@ -913,10 +929,365 @@ def analyze_with_provider(provider: str, data: pd.DataFrame, options: ChartOptio
     return analyze_with_chatgpt(data, options)
 
 # -----------------------------
+# 權證工具
+# -----------------------------
+@st.cache_data(show_spinner=False)
+def kgi_service(service_id: str, parameters: dict) -> object:
+    payload = {
+        "serviceId": service_id,
+        "parametersOfJson": json.dumps(
+            {**parameters, "LocationPathName": KGI_LOCATION_PATH},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
+    }
+    request = urllib.request.Request(
+        KGI_SERVICE_URL,
+        data=urllib.parse.urlencode(payload).encode(),
+        headers={"User-Agent": KGI_USER_AGENT},
+    )
+    context = ssl._create_unverified_context()
+    raw = urllib.request.urlopen(request, timeout=20, context=context).read().decode("utf-8", "ignore")
+    root = ET.fromstring(raw)
+    result = root.findtext("t:Result", namespaces=KGI_NS)
+    if result != "true":
+        message = root.findtext("t:Message", namespaces=KGI_NS) or "Unknown service error"
+        raise RuntimeError(f"{service_id} failed: {message}")
+    value = root.findtext("t:ValueOfJson", namespaces=KGI_NS) or ""
+    return json.loads(value) if value else ""
+
+
+@st.cache_data(show_spinner=False)
+def get_warrant_list() -> list[dict]:
+    return kgi_service("S0600013_GetWarrantList", {})
+
+
+def resolve_matches(query: str) -> list[dict]:
+    q = query.strip().lower()
+    if not q:
+        return []
+    warrants = get_warrant_list()
+    exact_code = [item for item in warrants if str(item.get("TEXT", "")).split(" ", 1)[0].lower() == q]
+    if exact_code:
+        return exact_code[:20]
+    exact_prefix = [item for item in warrants if str(item.get("TEXT", "")).lower().startswith(q)]
+    if exact_prefix:
+        return exact_prefix[:20]
+    contains = [item for item in warrants if q in str(item.get("TEXT", "")).lower()]
+    return contains[:20]
+
+
+def load_warrant_payload(insnbr: int) -> tuple[dict, dict]:
+    warrant = kgi_service("S0600013_GetWarrant", {"INSTR_INSNBR": insnbr})[0]
+    underlying = kgi_service("S0600017_GetUnderlyingByWarrant", {"INSTR_INSNBR": insnbr})[0]
+    return warrant, underlying
+
+
+def default_underlying_target(warrant: dict, underlying: dict) -> float:
+    stock_type = warrant.get("INSWRT_STOCKTYPE")
+    cp = warrant.get("INSWRT_CP")
+    if stock_type == "DI":
+        return max(safe_float(underlying.get("DEAL")), 1.0)
+    if cp == "認購":
+        return max(safe_float(underlying.get("BID1")), safe_float(underlying.get("DEAL")), 1.0)
+    return max(safe_float(underlying.get("ASK1")), safe_float(underlying.get("DEAL")), 1.0)
+
+
+def theoretical_price(insnbr: int, process_date: int, vol: float, underlying_price: float) -> float:
+    return float(
+        kgi_service(
+            "S0600018_GetTheoreticalPrice",
+            {
+                "INSTR_INSNBR": insnbr,
+                "PROCESS_DATE": process_date,
+                "VOL": vol,
+                "UNDERLYING_PRICE": underlying_price,
+            },
+        )
+    )
+
+
+def sensitivity_analysis(insnbr: int, process_date: int, vol: float, underlying_price: float) -> dict:
+    return kgi_service(
+        "S0600018_SensitivityAnalysis",
+        {
+            "INSTR_INSNBR": insnbr,
+            "PROCESS_DATE": process_date,
+            "VOL": vol,
+            "UNDERLYING_PRICE": underlying_price,
+        },
+    )
+
+
+def to_process_date(value: dt.date) -> int:
+    return value.year * 10000 + value.month * 100 + value.day
+
+
+def format_compact_date(value: object) -> str:
+    raw = str(int(safe_float(value))) if safe_float(value) else ""
+    if len(raw) == 8:
+        return f"{raw[:4]}/{raw[4:6]}/{raw[6:]}"
+    return raw
+
+
+def init_home_state() -> None:
+    st.session_state.setdefault("app_section", "home")
+    st.session_state.setdefault("query_text", "")
+    st.session_state.setdefault("match_options", [])
+    st.session_state.setdefault("loaded_warrant", None)
+    st.session_state.setdefault("loaded_underlying", None)
+    st.session_state.setdefault("calc_underlying_price", None)
+    st.session_state.setdefault("calc_biv", None)
+    st.session_state.setdefault("calc_date", None)
+
+
+def clear_loaded_warrant() -> None:
+    st.session_state["loaded_warrant"] = None
+    st.session_state["loaded_underlying"] = None
+    st.session_state["calc_underlying_price"] = None
+    st.session_state["calc_biv"] = None
+    st.session_state["calc_date"] = None
+
+
+def load_selected_warrant(selected_item: dict) -> None:
+    insnbr = int(float(selected_item["INSTR_INSNBR"]))
+    warrant, underlying = load_warrant_payload(insnbr)
+    st.session_state["loaded_warrant"] = warrant
+    st.session_state["loaded_underlying"] = underlying
+    st.session_state["calc_underlying_price"] = default_underlying_target(warrant, underlying)
+    st.session_state["calc_biv"] = safe_float(warrant.get("MTM_BID_VOL"), safe_float(warrant.get("BID_IMP_VOL"), 0.0))
+    st.session_state["calc_date"] = dt.date.today()
+
+
+def render_match_selector() -> None:
+    matches: list[dict] = st.session_state["match_options"]
+    if not matches:
+        return
+    options = {item["TEXT"]: item for item in matches}
+    selected_label = st.selectbox("找到多筆符合資料，請選擇", list(options.keys()), index=0)
+    col1, col2 = st.columns([0.35, 0.65])
+    with col1:
+        if st.button("載入權證", type="primary"):
+            load_selected_warrant(options[selected_label])
+    with col2:
+        st.caption("輸入代號時會優先抓精確代碼；輸入名稱時則依前綴與包含關係找最相近結果。")
+
+
+def build_reference_dataframe(result: dict) -> pd.DataFrame:
+    header = result["ANALYSIS_HEADER"][0]
+    col_headers = [f"{header[f'COL{i}']:.2f}" for i in range(1, 8)]
+    rows = []
+    for item in result["ANALYSIS"]:
+        row = {"BIV/標的價格": f"{item['UNDERLYING_PRICE']:,.2f} ({int(item['ROWINDEX']):+d}%)"}
+        for idx, key in enumerate(range(1, 8), start=0):
+            row[col_headers[idx]] = item[f"COL{key}"]
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def go_to(section: str) -> None:
+    st.session_state["app_section"] = section
+    st.rerun()
+
+
+def render_home() -> None:
+    st.title("投資工具首頁")
+    st.caption("這支程式同時包含 K 線型態分析與權證計算機，之後可直接部署到 GitHub 與 Streamlit Community Cloud。")
+    left, right = st.columns(2)
+    with left:
+        st.markdown("### K線型態分析")
+        st.write("查看台股 K 線、技術指標、型態訊號與 AI 分析。")
+        if st.button("前往 K線型態分析", type="primary", use_container_width=True):
+            go_to("stock2")
+    with right:
+        st.markdown("### 權證計算機")
+        st.write("使用凱基 backend service 查詢權證資料與試算參考價格。")
+        if st.button("前往 權證計算機", type="primary", use_container_width=True):
+            go_to("warrant")
+
+
+def render_warrant_calculator() -> None:
+    st.title("權證計算機")
+    st.caption("先輸入權證代號或名稱，再透過凱基 backend service 載入資料。載入後可自行修改標的目標價、BIV 與日期。")
+
+    st.markdown(
+        """
+        <style>
+        div[data-testid="stMetric"] {
+            border: 1px solid #dbe5f1;
+            padding: 12px 14px;
+            border-radius: 10px;
+            background: #f7fbff;
+        }
+        .result-box {
+            border: 2px solid #1f5fbf;
+            border-radius: 12px;
+            background: #fff3eb;
+            padding: 18px 20px;
+            min-height: 170px;
+        }
+        .result-box h3 {
+            color: #ff5a00;
+            margin: 0 0 12px 0;
+            font-size: 1.9rem;
+        }
+        .note-box {
+            border-left: 4px solid #ff5a00;
+            padding-left: 12px;
+            color: #4b5563;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    query_col, button_col, clear_col = st.columns([0.7, 0.15, 0.15])
+    with query_col:
+        query_text = st.text_input(
+            "請輸入權證代號或名稱",
+            value=st.session_state["query_text"],
+            placeholder="例如：057525 或 欣興統一66購02",
+        )
+    with button_col:
+        fetch_clicked = st.button("從凱基抓取", type="primary")
+    with clear_col:
+        clear_clicked = st.button("清空")
+
+    if clear_clicked:
+        st.session_state["query_text"] = ""
+        st.session_state["match_options"] = []
+        clear_loaded_warrant()
+        st.rerun()
+
+    if fetch_clicked:
+        st.session_state["query_text"] = query_text
+        clear_loaded_warrant()
+        matches = resolve_matches(query_text)
+        st.session_state["match_options"] = matches
+        if not matches:
+            st.warning("查無符合的權證，請再換一個代號或名稱。")
+        elif len(matches) == 1:
+            load_selected_warrant(matches[0])
+        else:
+            st.info(f"找到 {len(matches)} 筆符合資料，請從下方選一檔載入。")
+
+    render_match_selector()
+
+    warrant = st.session_state.get("loaded_warrant")
+    underlying = st.session_state.get("loaded_underlying")
+    if not warrant or not underlying:
+        st.info("目前左側試算欄位保持空白。請先輸入權證代號或名稱，再按「從凱基抓取」。")
+        return
+
+    calc_underlying_default = safe_float(st.session_state.get("calc_underlying_price"))
+    calc_biv_default = safe_float(st.session_state.get("calc_biv"))
+    calc_date_default = st.session_state.get("calc_date") or dt.date.today()
+
+    st.subheader(f"{warrant['INSTR_STKID']} {warrant['INSTR_NAME']} ({warrant['UND_INSTR_STKID']})")
+    summary_left, summary_right = st.columns([1.12, 0.88])
+
+    with summary_left:
+        quote_df = pd.DataFrame(
+            [
+                {
+                    "代碼": warrant["INSTR_STKID"],
+                    "名稱": warrant["INSTR_NAME"],
+                    "委買量": safe_float(warrant["BID1VOLUME"]),
+                    "最佳買價": safe_float(warrant["BID1"]),
+                    "最佳賣價": safe_float(warrant["ASK1"]),
+                    "委賣量": safe_float(warrant["ASK1VOLUME"]),
+                    "成交價": safe_float(warrant["DEAL"]),
+                    "成交量": safe_float(warrant["VOLUME"]),
+                    "漲跌": safe_float(warrant["CHANGE"]),
+                    "漲跌幅%": safe_float(warrant["CHANGE_PERCENT"]),
+                    "今日最高": safe_float(warrant["HIGH"]),
+                    "今日最低": safe_float(warrant["LOW"]),
+                },
+                {
+                    "代碼": underlying["INSTR_STKID"],
+                    "名稱": underlying["INSTR_NAME"],
+                    "委買量": safe_float(underlying["BID1VOLUME"]),
+                    "最佳買價": safe_float(underlying["BID1"]),
+                    "最佳賣價": safe_float(underlying["ASK1"]),
+                    "委賣量": safe_float(underlying["ASK1VOLUME"]),
+                    "成交價": safe_float(underlying["DEAL"]),
+                    "成交量": safe_float(underlying["VOLUME"]),
+                    "漲跌": safe_float(underlying["CHANGE"]),
+                    "漲跌幅%": safe_float(underlying["CHANGE_PERCENT"]),
+                    "今日最高": safe_float(underlying["HIGH"]),
+                    "今日最低": safe_float(underlying["LOW"]),
+                },
+            ]
+        )
+        st.dataframe(quote_df, use_container_width=True, hide_index=True)
+
+    with summary_right:
+        input_left, _, input_right = st.columns([0.48, 0.02, 0.50])
+        with input_left:
+            target_price = st.number_input("標的物目標價", min_value=0.0, value=calc_underlying_default, step=1.0, format="%.2f")
+            biv_pct = st.number_input("BIV(%)", min_value=0.0, value=calc_biv_default, step=0.1, format="%.2f")
+            process_date = st.date_input("日期", value=calc_date_default)
+        with input_right:
+            st.markdown("<div class='note-box'>載入後的三個值只是凱基當前資料的起始值，你可以自行覆蓋再試算。</div>", unsafe_allow_html=True)
+            run_calc = st.button("開始計算", type="primary")
+
+    if not run_calc:
+        st.info("請先調整標的物目標價、BIV 或日期，再按「開始計算」。")
+        return
+
+    process_date_int = to_process_date(process_date)
+    insnbr = int(float(warrant["INSTR_INSNBR"]))
+    theo_price = theoretical_price(insnbr, process_date_int, biv_pct, target_price)
+    analysis = sensitivity_analysis(insnbr, process_date_int, biv_pct, target_price)
+
+    result_text = (
+        f"{process_date:%Y/%m/%d}，當標的的價格為 {target_price:,.2f} 元，且波動率為 {biv_pct:.2f}% 時，"
+        f"此權證參考價格為 {theo_price:.2f} 元。"
+    )
+    st.markdown(
+        f"<div class='result-box'><h3>試算結果</h3><p style='font-size:1.45rem;line-height:1.7'>{result_text}</p></div>",
+        unsafe_allow_html=True,
+    )
+
+    greeks_df = pd.DataFrame(
+        [
+            {
+                "權證類型": warrant.get("INSWRT_AE", ""),
+                "實質槓桿": round(safe_float(warrant.get("LEVERAGE")), 4),
+                "價內外程度%": round(safe_float(warrant.get("IN_OUT_PERCENT")), 2),
+                "履約價": round(safe_float(warrant.get("INSWRT_STRIKE")), 4),
+                "行使比例": round(safe_float(warrant.get("INSWRT_EXECRATE")), 6),
+                "到期日": format_compact_date(warrant.get("INSWRT_EXPIRED_DATE")),
+                "Delta": round(safe_float(warrant.get("DELTA")), 6),
+                "Theta": round(safe_float(warrant.get("THETA")), 6),
+                "Gamma": round(safe_float(warrant.get("GAMMA")), 6),
+                "Vega": round(safe_float(warrant.get("VEGA")), 6),
+                "Rho": round(safe_float(warrant.get("RHO")), 6),
+                "內含價值": round(safe_float(warrant.get("INCLUDE_VALUE")), 6),
+                "三個月歷史波動率": round(safe_float(warrant.get("THREE_MONTH_HISTORY_VOLAILITY")), 4),
+            }
+        ]
+    )
+    st.subheader("各項相關係數")
+    st.dataframe(greeks_df, use_container_width=True, hide_index=True)
+
+    st.subheader("參考價格")
+    st.caption("這張矩陣直接使用凱基 `S0600018_SensitivityAnalysis` 回傳結果。")
+    st.dataframe(build_reference_dataframe(analysis), use_container_width=True, hide_index=True)
+
+    st.markdown(
+        """
+        <div class="note-box">
+        目前權證選單與試算結果都直接來自凱基 backend service。若凱基未來調整 serviceId、欄位名或參數格式，這支工具也要跟著更新。
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+# -----------------------------
 # 主介面
 # -----------------------------
-def main():
-    st.set_page_config(page_title="台股形態分析", layout="wide")
+def render_stock2_tool():
     st.title("📈 台股技術形態分析平台")
 
     with st.sidebar:
@@ -1042,6 +1413,24 @@ def main():
             and st.session_state.get("ai_analysis_provider") == provider
         ):
             st.markdown(st.session_state["ai_analysis"])
+
+
+def main():
+    init_home_state()
+    st.set_page_config(page_title="投資工具首頁", page_icon="📈", layout="wide")
+
+    current = st.session_state.get("app_section", "home")
+    if current != "home":
+        with st.sidebar:
+            if st.button("回首頁", use_container_width=True):
+                go_to("home")
+
+    if current == "stock2":
+        render_stock2_tool()
+    elif current == "warrant":
+        render_warrant_calculator()
+    else:
+        render_home()
 
 
 if __name__ == "__main__":
