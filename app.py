@@ -48,6 +48,7 @@ TPEX_OPENAPI_BASE = "https://www.tpex.org.tw/openapi/v1"
 ENV_QUOTES = "\"'“”‘’"
 KGI_SERVICE_URL = "https://warrant.kgi.com/EDWebService/WSInterfaceSwap.asmx/GetService"
 KGI_LOCATION_PATH = "/EDWebSite/Views/WarrantCalculator/WarrantCalculator.aspx"
+KGI_SEARCH_LOCATION_PATH = "/EDWebSite/Views/WarrantSearch/WarrantSearch.aspx"
 KGI_USER_AGENT = "Mozilla/5.0"
 KGI_NS = {"t": "http://tempuri.org/"}
 PATTERN_SELECT_ALL = "全選"
@@ -932,11 +933,11 @@ def analyze_with_provider(provider: str, data: pd.DataFrame, options: ChartOptio
 # 權證工具
 # -----------------------------
 @st.cache_data(show_spinner=False)
-def kgi_service(service_id: str, parameters: dict) -> object:
+def kgi_service(service_id: str, parameters: dict, location_path: str = KGI_LOCATION_PATH) -> object:
     payload = {
         "serviceId": service_id,
         "parametersOfJson": json.dumps(
-            {**parameters, "LocationPathName": KGI_LOCATION_PATH},
+            {**parameters, "LocationPathName": location_path},
             ensure_ascii=False,
             separators=(",", ":"),
         ),
@@ -962,6 +963,11 @@ def get_warrant_list() -> list[dict]:
     return kgi_service("S0600013_GetWarrantList", {})
 
 
+@st.cache_data(show_spinner=False)
+def get_underlying_list() -> list[dict]:
+    return kgi_service("S0600017_GetUnderlyingList", {}, location_path=KGI_SEARCH_LOCATION_PATH)
+
+
 def resolve_matches(query: str) -> list[dict]:
     q = query.strip().lower()
     if not q:
@@ -974,6 +980,21 @@ def resolve_matches(query: str) -> list[dict]:
     if exact_prefix:
         return exact_prefix[:20]
     contains = [item for item in warrants if q in str(item.get("TEXT", "")).lower()]
+    return contains[:20]
+
+
+def resolve_underlying_matches(query: str) -> list[dict]:
+    q = query.strip().lower()
+    if not q:
+        return []
+    underlyings = get_underlying_list()
+    exact_code = [item for item in underlyings if str(item.get("INSTR_STKID_NAME", "")).split(" ", 1)[0].lower() == q]
+    if exact_code:
+        return exact_code[:20]
+    exact_prefix = [item for item in underlyings if str(item.get("INSTR_STKID_NAME", "")).lower().startswith(q)]
+    if exact_prefix:
+        return exact_prefix[:20]
+    contains = [item for item in underlyings if q in str(item.get("INSTR_STKID_NAME", "")).lower()]
     return contains[:20]
 
 
@@ -1019,6 +1040,43 @@ def sensitivity_analysis(insnbr: int, process_date: int, vol: float, underlying_
     )
 
 
+def fetch_underlying_warrants(
+    underlying_insnbr: int,
+    cp: str = "認購",
+    last_days_from: int = 360,
+    execrate_min: float = 0.005,
+    leverage_min: float = 0.0,
+    volume_min: float = 0.0,
+) -> list[dict]:
+    params = {
+        "NORMAL_OR_CATTLE_BEAR": 0,
+        "INSWRT_ISSUER_NAME": "ALL",
+        "STRIKE_FROM": -1,
+        "STRIKE_TO": -1,
+        "VOLUME": -1,
+        "UND_INSTR_INSNBR": underlying_insnbr,
+        "LAST_DAYS_FROM": last_days_from,
+        "LAST_DAYS_TO": -1,
+        "IMP_VOL": -1,
+        "CP": cp,
+        "IN_OUT_PERCENT_FROM": -1,
+        "IN_OUT_PERCENT_TO": -1,
+        "BID_ASK_SPREAD_PERCENT": -1,
+        "LEVERAGE": -1,
+        "EXECRATE": -1,
+        "OUTSTANDING_PERCENT": -1,
+        "BARRIER_DEAL_PERCENT": -1,
+    }
+    rows = kgi_service("S0600013_GetWarrants", params, location_path=KGI_SEARCH_LOCATION_PATH)
+    return [
+        row
+        for row in rows
+        if safe_float(row.get("INSWRT_EXECRATE")) >= execrate_min
+        and safe_float(row.get("LEVERAGE")) >= leverage_min
+        and safe_float(row.get("VOLUME")) >= volume_min
+    ]
+
+
 def to_process_date(value: dt.date) -> int:
     return value.year * 10000 + value.month * 100 + value.day
 
@@ -1039,6 +1097,15 @@ def init_home_state() -> None:
     st.session_state.setdefault("calc_underlying_price", None)
     st.session_state.setdefault("calc_biv", None)
     st.session_state.setdefault("calc_date", None)
+    st.session_state.setdefault("recommend_query_text", "")
+    st.session_state.setdefault("recommend_matches", [])
+    st.session_state.setdefault("recommend_underlying", None)
+    st.session_state.setdefault("recommend_rows", None)
+    st.session_state.setdefault("recommend_style", "偏均衡")
+    st.session_state.setdefault("recommend_custom_days", 360)
+    st.session_state.setdefault("recommend_custom_execrate", 0.005)
+    st.session_state.setdefault("recommend_custom_leverage", 2.0)
+    st.session_state.setdefault("recommend_custom_volume", 100.0)
 
 
 def clear_loaded_warrant() -> None:
@@ -1047,6 +1114,12 @@ def clear_loaded_warrant() -> None:
     st.session_state["calc_underlying_price"] = None
     st.session_state["calc_biv"] = None
     st.session_state["calc_date"] = None
+
+
+def clear_recommendation_state() -> None:
+    st.session_state["recommend_matches"] = []
+    st.session_state["recommend_underlying"] = None
+    st.session_state["recommend_rows"] = None
 
 
 def load_selected_warrant(selected_item: dict) -> None:
@@ -1073,6 +1146,24 @@ def render_match_selector() -> None:
         st.caption("輸入代號時會優先抓精確代碼；輸入名稱時則依前綴與包含關係找最相近結果。")
 
 
+def render_underlying_match_selector() -> None:
+    matches: list[dict] = st.session_state["recommend_matches"]
+    if not matches:
+        return
+    options = {item["INSTR_STKID_NAME"]: item for item in matches}
+    selected_label = st.selectbox("找到多筆標的，請選擇", list(options.keys()), index=0)
+    col1, col2 = st.columns([0.35, 0.65])
+    with col1:
+        if st.button("載入標的並推薦", type="primary"):
+            item = options[selected_label]
+            st.session_state["recommend_underlying"] = item
+            thresholds = recommendation_thresholds(st.session_state.get("recommend_style", "偏均衡"))
+            rows = fetch_underlying_warrants(int(float(item["INSTR_INSNBR"])), **thresholds)
+            st.session_state["recommend_rows"] = rows
+    with col2:
+        st.caption("輸入標的代號時會優先抓精確代碼；輸入名稱時則依前綴與包含關係找最相近結果。")
+
+
 def build_reference_dataframe(result: dict) -> pd.DataFrame:
     header = result["ANALYSIS_HEADER"][0]
     col_headers = [f"{header[f'COL{i}']:.2f}" for i in range(1, 8)]
@@ -1085,6 +1176,156 @@ def build_reference_dataframe(result: dict) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def score_recommendation(row: dict, style: str) -> float:
+    leverage = safe_float(row.get("LEVERAGE"))
+    execrate = safe_float(row.get("INSWRT_EXECRATE"))
+    volume = safe_float(row.get("VOLUME"))
+    spread = safe_float(row.get("BID_ASK_SPREAD_PERCENT"))
+    siv = safe_float(row.get("ASK_IMP_VOL"))
+    biv = safe_float(row.get("BID_IMP_VOL"))
+    gap = max(siv - biv, 0.0)
+    last_days = safe_float(row.get("LAST_DAYS"))
+    in_out_abs = abs(safe_float(row.get("IN_OUT_PERCENT")))
+    outstanding = safe_float(row.get("OUTSTANDING_PERCENT"))
+    price = safe_float(row.get("DEAL"))
+
+    if style == "偏高流動性":
+        score = 0.0
+        score += min(volume, 8000.0) / 12
+        score += min(last_days, 720.0) / 15
+        score += min(leverage, 8.0) * 8
+        score += min(execrate, 0.02) * 2200
+        score -= spread * 18
+        score -= gap * 9
+        score -= max(siv - 105.0, 0.0) * 1.1
+        score -= max(in_out_abs - 10.0, 0.0) * 1.5
+        score -= max(outstanding - 75.0, 0.0) * 0.5
+        if price <= 0:
+            score -= 50
+        return score
+
+    if style == "偏積極":
+        score = 0.0
+        score += min(leverage, 12.0) * 18
+        score += min(execrate, 0.02) * 3600
+        score += min(volume, 5000.0) / 35
+        score += min(last_days, 720.0) / 18
+        score -= spread * 7
+        score -= gap * 4
+        score -= max(siv - 120.0, 0.0) * 0.5
+        score -= max(in_out_abs - 18.0, 0.0) * 0.8
+        score -= max(outstanding - 90.0, 0.0) * 0.2
+        if price <= 0:
+            score -= 50
+        return score
+
+    if style == "偏均衡":
+        score = 0.0
+        score += min(leverage, 10.0) * 13
+        score += min(execrate, 0.02) * 3200
+        score += min(volume, 6000.0) / 22
+        score += min(last_days, 720.0) / 14
+        score -= spread * 10
+        score -= gap * 6
+        score -= max(siv - 108.0, 0.0) * 0.9
+        score -= max(in_out_abs - 14.0, 0.0) * 1.1
+        score -= max(outstanding - 82.0, 0.0) * 0.35
+        if price <= 0:
+            score -= 50
+        return score
+
+    score = 0.0
+    score += min(leverage, 10.0) * 12
+    score += min(execrate, 0.02) * 3000
+    score += min(volume, 5000.0) / 25
+    score += min(last_days, 720.0) / 12
+    score -= spread * 9
+    score -= gap * 5
+    score -= max(siv - 110.0, 0.0) * 0.8
+    score -= max(in_out_abs - 12.0, 0.0) * 1.5
+    score -= max(outstanding - 80.0, 0.0) * 0.4
+    if price <= 0:
+        score -= 50
+    return score
+
+
+def recommendation_reason(row: dict, style: str) -> str:
+    notes = []
+    if safe_float(row.get("LEVERAGE")) >= 4:
+        notes.append("槓桿較高")
+    if safe_float(row.get("BID_ASK_SPREAD_PERCENT")) <= 3:
+        notes.append("價差比偏佳")
+    if safe_float(row.get("VOLUME")) >= 500:
+        notes.append("成交量相對足")
+    if safe_float(row.get("ASK_IMP_VOL")) and safe_float(row.get("ASK_IMP_VOL")) - safe_float(row.get("BID_IMP_VOL")) <= 8:
+        notes.append("BIV/SIV gap 不大")
+    if safe_float(row.get("INSWRT_EXECRATE")) >= 0.007:
+        notes.append("行使比例偏高")
+    if style == "偏保守":
+        notes.append("保守排序")
+    elif style == "偏積極":
+        notes.append("積極排序")
+    elif style == "偏高流動性":
+        notes.append("流動性排序")
+    else:
+        notes.append("均衡排序")
+    return "、".join(notes) if notes else "條件均衡"
+
+
+def build_recommendation_dataframe(rows: list[dict], style: str) -> pd.DataFrame:
+    filtered = []
+    for row in rows:
+        if safe_float(row.get("DEAL")) <= 0:
+            continue
+        if safe_float(row.get("ASK1_PRICE")) <= 0 and safe_float(row.get("ASK1")) <= 0:
+            continue
+        filtered.append(row)
+
+    ranked = sorted(filtered, key=lambda row: score_recommendation(row, style), reverse=True)
+    top_rows = ranked[:10]
+    records = []
+    for idx, row in enumerate(top_rows, start=1):
+        biv = safe_float(row.get("BID_IMP_VOL"))
+        siv = safe_float(row.get("ASK_IMP_VOL"))
+        records.append(
+            {
+                "名次": idx,
+                "權證代碼": row.get("INSTR_STKID", ""),
+                "權證名稱": row.get("INSTR_NAME", ""),
+                "成交價": round(safe_float(row.get("DEAL")), 3),
+                "成交量": int(safe_float(row.get("VOLUME"))),
+                "買賣價差比%": round(safe_float(row.get("BID_ASK_SPREAD_PERCENT")), 2),
+                "BIV": round(biv, 2),
+                "SIV": round(siv, 2),
+                "BIV-SIV gap": round(siv - biv, 2),
+                "履約價": round(safe_float(row.get("INSWRT_STRIKE")), 2),
+                "行使比例": round(safe_float(row.get("INSWRT_EXECRATE")), 6),
+                "價內外%": round(safe_float(row.get("IN_OUT_PERCENT")), 2),
+                "剩餘天數": int(safe_float(row.get("LAST_DAYS"))),
+                "實質槓桿": round(safe_float(row.get("LEVERAGE")), 2),
+                "流通在外%": round(safe_float(row.get("OUTSTANDING_PERCENT")), 2),
+                "推薦理由": recommendation_reason(row, style),
+            }
+        )
+    return pd.DataFrame(records)
+
+
+def recommendation_thresholds(style: str) -> dict:
+    if style == "自訂條件":
+        return {
+            "last_days_from": int(st.session_state.get("recommend_custom_days", 360)),
+            "execrate_min": float(st.session_state.get("recommend_custom_execrate", 0.005)),
+            "leverage_min": float(st.session_state.get("recommend_custom_leverage", 2.0)),
+            "volume_min": float(st.session_state.get("recommend_custom_volume", 100.0)),
+        }
+    return {
+        "last_days_from": 360,
+        "execrate_min": 0.005,
+        "leverage_min": 0.0,
+        "volume_min": 0.0,
+    }
+
+
 def go_to(section: str) -> None:
     st.session_state["app_section"] = section
     st.rerun()
@@ -1092,18 +1333,23 @@ def go_to(section: str) -> None:
 
 def render_home() -> None:
     st.title("投資工具首頁")
-    st.caption("這支程式同時包含 K 線型態分析與權證計算機，之後可直接部署到 GitHub 與 Streamlit Community Cloud。")
-    left, right = st.columns(2)
+    st.caption("這支程式同時包含 K 線型態分析、權證計算機與權證推薦，之後可直接部署到 GitHub 與 Streamlit Community Cloud。")
+    left, middle, right = st.columns(3)
     with left:
         st.markdown("### K線型態分析")
         st.write("查看台股 K 線、技術指標、型態訊號與 AI 分析。")
         if st.button("前往 K線型態分析", type="primary", use_container_width=True):
             go_to("stock2")
-    with right:
+    with middle:
         st.markdown("### 權證計算機")
         st.write("使用凱基 backend service 查詢權證資料與試算參考價格。")
         if st.button("前往 權證計算機", type="primary", use_container_width=True):
             go_to("warrant")
+    with right:
+        st.markdown("### 權證推薦")
+        st.write("依標的篩選認購權證，優先找長天期、較高行使比例與較佳交易條件。")
+        if st.button("前往 權證推薦", type="primary", use_container_width=True):
+            go_to("recommend")
 
 
 def render_warrant_calculator() -> None:
@@ -1284,6 +1530,139 @@ def render_warrant_calculator() -> None:
         unsafe_allow_html=True,
     )
 
+
+def render_warrant_recommendation() -> None:
+    st.title("權證推薦")
+    st.caption("先輸入標的代號或名稱，再用凱基 backend service 抓出符合條件的認購權證。預設條件：剩餘天數 >= 360、行使比例 >= 0.005。")
+
+    style = st.radio(
+        "推薦風格",
+        ["偏保守", "偏均衡", "偏積極", "偏高流動性", "自訂條件"],
+        index=["偏保守", "偏均衡", "偏積極", "偏高流動性", "自訂條件"].index(
+            st.session_state.get("recommend_style", "偏均衡")
+        ),
+        horizontal=True,
+        help="偏保守重視成本與風險，偏均衡平衡槓桿與流動性，偏積極強調槓桿與行使比例，偏高流動性則優先看量與價差，自訂條件可自設最低門檻。",
+    )
+    st.session_state["recommend_style"] = style
+
+    if style == "自訂條件":
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            st.session_state["recommend_custom_days"] = st.number_input(
+                "最低剩餘天數",
+                min_value=1,
+                value=int(st.session_state.get("recommend_custom_days", 360)),
+                step=30,
+            )
+        with c2:
+            st.session_state["recommend_custom_execrate"] = st.number_input(
+                "最低行使比例",
+                min_value=0.0,
+                value=float(st.session_state.get("recommend_custom_execrate", 0.005)),
+                step=0.001,
+                format="%.3f",
+            )
+        with c3:
+            st.session_state["recommend_custom_leverage"] = st.number_input(
+                "最低實質槓桿",
+                min_value=0.0,
+                value=float(st.session_state.get("recommend_custom_leverage", 2.0)),
+                step=0.5,
+                format="%.1f",
+            )
+        with c4:
+            st.session_state["recommend_custom_volume"] = st.number_input(
+                "最低成交量",
+                min_value=0.0,
+                value=float(st.session_state.get("recommend_custom_volume", 100.0)),
+                step=50.0,
+                format="%.0f",
+            )
+
+    query_col, button_col, clear_col = st.columns([0.7, 0.15, 0.15])
+    with query_col:
+        query_text = st.text_input(
+            "請輸入標的代號或名稱",
+            value=st.session_state["recommend_query_text"],
+            placeholder="例如：3037 或 欣興",
+            key="recommend_input",
+        )
+    with button_col:
+        fetch_clicked = st.button("抓取候選", type="primary")
+    with clear_col:
+        clear_clicked = st.button("清空推薦")
+
+    if clear_clicked:
+        st.session_state["recommend_query_text"] = ""
+        clear_recommendation_state()
+        st.rerun()
+
+    if fetch_clicked:
+        st.session_state["recommend_query_text"] = query_text
+        clear_recommendation_state()
+        matches = resolve_underlying_matches(query_text)
+        st.session_state["recommend_matches"] = matches
+        if not matches:
+            st.warning("查無符合的標的，請再換一個代號或名稱。")
+        elif len(matches) == 1:
+            item = matches[0]
+            st.session_state["recommend_underlying"] = item
+            thresholds = recommendation_thresholds(style)
+            rows = fetch_underlying_warrants(int(float(item["INSTR_INSNBR"])), **thresholds)
+            st.session_state["recommend_rows"] = rows
+        else:
+            st.info(f"找到 {len(matches)} 筆符合標的，請從下方選一檔載入。")
+
+    render_underlying_match_selector()
+
+    underlying = st.session_state.get("recommend_underlying")
+    rows = st.session_state.get("recommend_rows")
+    if not underlying or rows is None:
+        st.info("請先輸入標的代號或名稱，再按「抓取候選」。")
+        return
+
+    st.subheader(f"標的：{underlying.get('INSTR_STKID_NAME', '')}")
+    if style == "偏保守":
+        st.write("目前使用保守排序：更重視成交量、買賣價差比、BIV/SIV gap 與 SIV 成本，仍保留對槓桿與行使比例的要求。")
+    elif style == "偏均衡":
+        st.write("目前使用均衡排序：在槓桿、行使比例、成交量、買賣價差比與 BIV/SIV gap 之間做平衡。")
+    elif style == "偏高流動性":
+        st.write("目前使用高流動性排序：優先看成交量、買賣價差比與較小的 BIV/SIV gap，降低進出場摩擦。")
+    elif style == "自訂條件":
+        st.write(
+            "目前使用自訂條件："
+            f"剩餘天數 >= {int(st.session_state.get('recommend_custom_days', 360))}、"
+            f"行使比例 >= {float(st.session_state.get('recommend_custom_execrate', 0.005)):.3f}、"
+            f"實質槓桿 >= {float(st.session_state.get('recommend_custom_leverage', 2.0)):.1f}、"
+            f"成交量 >= {int(float(st.session_state.get('recommend_custom_volume', 100.0)))}。"
+        )
+    else:
+        st.write("目前使用積極排序：更重視實質槓桿與行使比例，對價差與波動成本的容忍度會高一些。")
+
+    if not rows:
+        st.warning("這個標的目前查無符合條件的權證。")
+        return
+
+    summary_cols = st.columns(4)
+    summary_cols[0].metric("候選總數", f"{len(rows)}")
+    thresholds = recommendation_thresholds(style)
+    summary_cols[1].metric("條件", f"認購 / {int(thresholds['last_days_from'])}天+")
+    summary_cols[2].metric("最低行使比例", f"{float(thresholds['execrate_min']):.3f}")
+    summary_cols[3].metric("最低槓桿 / 量", f"{float(thresholds['leverage_min']):.1f} / {int(thresholds['volume_min'])}")
+
+    ranking_style = "偏均衡" if style == "自訂條件" else style
+    recommend_df = build_recommendation_dataframe(rows, ranking_style)
+    if recommend_df.empty:
+        st.warning("目前符合基本條件的資料中，沒有可用於推薦排序的有效報價。")
+        return
+
+    st.subheader("建議先看")
+    st.dataframe(recommend_df.head(5), use_container_width=True, hide_index=True)
+
+    st.subheader("前 10 檔候選")
+    st.dataframe(recommend_df, use_container_width=True, hide_index=True)
+
 # -----------------------------
 # 主介面
 # -----------------------------
@@ -1429,6 +1808,8 @@ def main():
         render_stock2_tool()
     elif current == "warrant":
         render_warrant_calculator()
+    elif current == "recommend":
+        render_warrant_recommendation()
     else:
         render_home()
 
