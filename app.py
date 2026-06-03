@@ -1252,6 +1252,16 @@ def get_active_etf_spreadsheet(spreadsheet_id: str):
     return client.open_by_key(spreadsheet_id)
 
 
+@st.cache_resource(show_spinner=False)
+def get_active_etf_worksheets(spreadsheet_id: str):
+    spreadsheet = get_active_etf_spreadsheet(spreadsheet_id)
+    return {
+        ACTIVE_ETF_WATCHLIST_SHEET: get_or_create_worksheet(spreadsheet, ACTIVE_ETF_WATCHLIST_SHEET, rows=200, cols=2),
+        ACTIVE_ETF_SNAPSHOTS_SHEET: get_or_create_worksheet(spreadsheet, ACTIVE_ETF_SNAPSHOTS_SHEET, rows=5000, cols=12),
+        ACTIVE_ETF_META_SHEET: get_or_create_worksheet(spreadsheet, ACTIVE_ETF_META_SHEET, rows=200, cols=5),
+    }
+
+
 def get_or_create_worksheet(spreadsheet, title: str, rows: int = 1000, cols: int = 20):
     try:
         return spreadsheet.worksheet(title)
@@ -1264,10 +1274,19 @@ def worksheet_records(worksheet) -> list[dict]:
     return rows if isinstance(rows, list) else []
 
 
+@st.cache_data(ttl=60, show_spinner=False)
+def load_active_etf_state_from_google_sheets_cached(spreadsheet_id: str) -> dict:
+    return load_active_etf_state_from_google_sheets_uncached(spreadsheet_id)
+
+
 def load_active_etf_state_from_google_sheets() -> dict:
-    spreadsheet = get_active_etf_spreadsheet(active_etf_google_sheet_id())
-    watchlist_sheet = get_or_create_worksheet(spreadsheet, ACTIVE_ETF_WATCHLIST_SHEET, rows=200, cols=2)
-    snapshot_sheet = get_or_create_worksheet(spreadsheet, ACTIVE_ETF_SNAPSHOTS_SHEET, rows=5000, cols=12)
+    return load_active_etf_state_from_google_sheets_cached(active_etf_google_sheet_id())
+
+
+def load_active_etf_state_from_google_sheets_uncached(spreadsheet_id: str) -> dict:
+    worksheets = get_active_etf_worksheets(spreadsheet_id)
+    watchlist_sheet = worksheets[ACTIVE_ETF_WATCHLIST_SHEET]
+    snapshot_sheet = worksheets[ACTIVE_ETF_SNAPSHOTS_SHEET]
 
     watchlist_rows = worksheet_records(watchlist_sheet)
     if watchlist_rows:
@@ -1322,10 +1341,10 @@ def load_active_etf_state_from_google_sheets() -> dict:
 
 def save_active_etf_state_to_google_sheets(state: dict) -> tuple[bool, str]:
     try:
-        spreadsheet = get_active_etf_spreadsheet(active_etf_google_sheet_id())
-        watchlist_sheet = get_or_create_worksheet(spreadsheet, ACTIVE_ETF_WATCHLIST_SHEET, rows=200, cols=2)
-        snapshot_sheet = get_or_create_worksheet(spreadsheet, ACTIVE_ETF_SNAPSHOTS_SHEET, rows=5000, cols=12)
-        meta_sheet = get_or_create_worksheet(spreadsheet, ACTIVE_ETF_META_SHEET, rows=200, cols=5)
+        worksheets = get_active_etf_worksheets(active_etf_google_sheet_id())
+        watchlist_sheet = worksheets[ACTIVE_ETF_WATCHLIST_SHEET]
+        snapshot_sheet = worksheets[ACTIVE_ETF_SNAPSHOTS_SHEET]
+        meta_sheet = worksheets[ACTIVE_ETF_META_SHEET]
 
         watchlist_values = [["etf_code", "updated_at"]]
         updated_at = dt.datetime.now().isoformat(timespec="seconds")
@@ -1370,6 +1389,7 @@ def save_active_etf_state_to_google_sheets(state: dict) -> tuple[bool, str]:
         snapshot_sheet.update(values=snapshot_values, range_name="A1")
         meta_sheet.clear()
         meta_sheet.update(values=meta_values, range_name="A1")
+        load_active_etf_state_from_google_sheets_cached.clear()
         return True, ""
     except PermissionError as exc:
         return False, (
@@ -1613,7 +1633,8 @@ def init_home_state() -> None:
     st.session_state.setdefault("recommend_custom_execrate", 0.005)
     st.session_state.setdefault("recommend_custom_leverage", 2.0)
     st.session_state.setdefault("recommend_custom_volume", 100.0)
-    st.session_state.setdefault("active_etf_state", load_active_etf_state())
+    if "active_etf_state" not in st.session_state:
+        st.session_state["active_etf_state"] = load_active_etf_state()
     st.session_state.setdefault("active_etf_new_code", "")
     st.session_state.setdefault("active_etf_latest_changes", None)
     st.session_state.setdefault("active_etf_last_errors", [])
@@ -2188,7 +2209,9 @@ def render_active_etf_tracker() -> None:
         for item in active_etf_storage_diagnostics():
             st.write(f"- {item}")
 
-    state = st.session_state.setdefault("active_etf_state", load_active_etf_state())
+    if "active_etf_state" not in st.session_state:
+        st.session_state["active_etf_state"] = load_active_etf_state()
+    state = st.session_state["active_etf_state"]
     state.setdefault("watchlist", [])
     state.setdefault("history", {})
 
