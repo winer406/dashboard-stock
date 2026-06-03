@@ -4,7 +4,7 @@
 功能：
 1. 輸入台股代碼與查詢天數
 2. 技術指標：布林通道、5/20/60/120 日均線、KD、RSI、MACD
-3. K線形態偵測：Morning Star, Evening Star, Shooting Star 與多種吞噬/母子型態
+3. K線形態偵測：Morning Star, Evening Star, Shooting Star、紅三兵、黑三鴉與多種吞噬/母子型態
 4. 自動處理 Yahoo Finance 資料結構
 5. 可切換 ChatGPT / Gemini 分析 K 線圖、成交量與布林通道
 
@@ -15,9 +15,12 @@ pip install streamlit yfinance pandas plotly
 from dataclasses import dataclass
 import csv
 import datetime as dt
+import html as html_lib
 import io
 import json
 import os
+from pathlib import Path
+import re
 import ssl
 import urllib.error
 import urllib.parse
@@ -29,6 +32,13 @@ import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
 from plotly.subplots import make_subplots
+
+try:
+    import gspread
+    from google.oauth2.service_account import Credentials
+except ImportError:
+    gspread = None
+    Credentials = None
 
 # -----------------------------
 # 基本設定
@@ -51,12 +61,32 @@ KGI_LOCATION_PATH = "/EDWebSite/Views/WarrantCalculator/WarrantCalculator.aspx"
 KGI_SEARCH_LOCATION_PATH = "/EDWebSite/Views/WarrantSearch/WarrantSearch.aspx"
 KGI_USER_AGENT = "Mozilla/5.0"
 KGI_NS = {"t": "http://tempuri.org/"}
+ETFINFO_HOLDINGS_URL = "https://www.etfinfo.tw/etf/{code}/holdings"
+ACTIVE_ETF_STATE_PATH = Path(__file__).with_name("active_etf_state.json")
+ACTIVE_ETF_FALLBACK_STATE_PATH = Path.home() / ".warrant_app" / "active_etf_state.json"
+ACTIVE_ETF_WATCHLIST_SHEET = "active_etf_watchlist"
+ACTIVE_ETF_SNAPSHOTS_SHEET = "active_etf_snapshots"
+ACTIVE_ETF_META_SHEET = "active_etf_meta"
+ACTIVE_ETF_SNAPSHOT_COLUMNS = [
+    "etf_code",
+    "etf_name",
+    "snapshot_date",
+    "stock_code",
+    "stock_name",
+    "change_percent",
+    "close_price",
+    "weight_percent",
+    "shares",
+    "contribution_percent",
+]
 PATTERN_SELECT_ALL = "全選"
 PATTERN_CHOICES = (
     PATTERN_SELECT_ALL,
     "Morning Star (晨星)",
     "Evening Star (暮星)",
     "Shooting Star (射擊之星)",
+    "Three White Soldiers (紅三兵)",
+    "Three Black Crows (黑三鴉)",
     "Bullish Engulfing (多頭吞噬)",
     "Hammer (槌子)",
     "Hanging Man (吊人線)",
@@ -79,6 +109,8 @@ class ChartOptions:
     show_morning_star: bool
     show_evening_star: bool
     show_shooting_star: bool
+    show_three_white_soldiers: bool
+    show_three_black_crows: bool
     show_bullish_engulfing: bool
     show_hammer: bool
     show_hanging_man: bool
@@ -146,6 +178,52 @@ def detect_shooting_star(data: pd.DataFrame) -> pd.Series:
         # 上影線長度需為實體2倍以上，且下影線極短
         is_shooting = (upper_shadow >= body * 2) and (lower_shadow <= total_range * 0.1) and (body <= total_range * 0.3)
         signals.iloc[i] = is_shooting
+    return signals
+
+
+def detect_three_white_soldiers(data: pd.DataFrame) -> pd.Series:
+    """紅三兵：連續三根陽線、收盤步步高升，且後兩根開盤落在前一根實體內。"""
+    signals = pd.Series(False, index=data.index)
+    for i in range(2, len(data)):
+        first, second, third = data.iloc[i - 2], data.iloc[i - 1], data.iloc[i]
+        candles = [first, second, third]
+        if not all(candle["Close"] > candle["Open"] for candle in candles):
+            continue
+
+        closes_rising = first["Close"] < second["Close"] < third["Close"]
+        opens_in_body = (
+            min(first["Open"], first["Close"]) <= second["Open"] <= max(first["Open"], first["Close"])
+            and min(second["Open"], second["Close"]) <= third["Open"] <= max(second["Open"], second["Close"])
+        )
+        body1 = abs(first["Close"] - first["Open"])
+        body2 = abs(second["Close"] - second["Open"])
+        body3 = abs(third["Close"] - third["Open"])
+        bodies_non_decreasing = body2 >= body1 and body3 >= body2
+
+        signals.iloc[i] = closes_rising and opens_in_body and bodies_non_decreasing
+    return signals
+
+
+def detect_three_black_crows(data: pd.DataFrame) -> pd.Series:
+    """黑三鴉：連續三根陰線、收盤步步走低，且後兩根開盤落在前一根實體內。"""
+    signals = pd.Series(False, index=data.index)
+    for i in range(2, len(data)):
+        first, second, third = data.iloc[i - 2], data.iloc[i - 1], data.iloc[i]
+        candles = [first, second, third]
+        if not all(candle["Close"] < candle["Open"] for candle in candles):
+            continue
+
+        closes_falling = first["Close"] > second["Close"] > third["Close"]
+        opens_in_body = (
+            min(first["Open"], first["Close"]) <= second["Open"] <= max(first["Open"], first["Close"])
+            and min(second["Open"], second["Close"]) <= third["Open"] <= max(second["Open"], second["Close"])
+        )
+        closes_near_low = all(
+            (candle["Close"] - candle["Low"]) <= max((candle["High"] - candle["Low"]) * 0.2, 0.001)
+            for candle in candles
+        )
+
+        signals.iloc[i] = closes_falling and opens_in_body and closes_near_low
     return signals
 
 def detect_bullish_engulfing(data: pd.DataFrame) -> pd.Series:
@@ -518,6 +596,8 @@ def get_stock_data(options: ChartOptions) -> pd.DataFrame:
     data["Morning Star"] = detect_morning_star(data)
     data["Evening Star"] = detect_evening_star(data)
     data["Shooting Star"] = detect_shooting_star(data)
+    data["Three White Soldiers"] = detect_three_white_soldiers(data)
+    data["Three Black Crows"] = detect_three_black_crows(data)
     data["Bullish Engulfing"] = detect_bullish_engulfing(data)
     data["Hammer"] = detect_hammer(data)
     data["Hanging Man"] = detect_hanging_man(data)
@@ -615,33 +695,22 @@ def draw_chart(data: pd.DataFrame, options: ChartOptions):
         fig.add_trace(go.Scatter(x=data.index, y=data["Upper Band"], name="布林上軌", line=dict(color="orange", dash="dash")), row=1, col=1)
         fig.add_trace(go.Scatter(x=data.index, y=data["Lower Band"], name="布林下軌", line=dict(color="orange", dash="dash")), row=1, col=1)
 
-    # 形態標記
-    pattern_configs = [
-        (options.show_morning_star, "Morning Star", "gold", "star", "Low", 0.97),
-        (options.show_evening_star, "Evening Star", "violet", "star-diamond", "High", 1.03),
-        (options.show_shooting_star, "Shooting Star", "cyan", "triangle-down", "High", 1.02)
-    ]
-    
-    for show, col, color, symbol, pos, offset in pattern_configs:
-        if show:
-            sigs = data[data[col]]
-            if not sigs.empty:
-                fig.add_trace(go.Scatter(
-                    x=sigs.index, y=sigs[pos] * offset, mode="markers",
-                    marker=dict(color=color, size=12, symbol=symbol), name=col
-                ), row=1, col=1)
-
     label_pattern_configs = [
-        (options.show_bullish_engulfing, "Bullish Engulfing", "多頭吞噬", "Low", 0.965, "red", "white", "top"),
-        (options.show_hammer, "Hammer", "槌子", "Low", 0.955, "red", "white", "top"),
-        (options.show_hanging_man, "Hanging Man", "吊人線", "High", 1.045, "green", "black", "bottom"),
-        (options.show_meteor, "Meteor", "流星", "High", 1.035, "green", "black", "bottom"),
-        (options.show_bullish_harami, "Bullish Harami", "多頭母子", "Low", 0.945, "red", "white", "top"),
-        (options.show_bullish_harami_cross, "Bullish Harami Cross", "多頭母子十字", "Low", 0.935, "red", "white", "top"),
-        (options.show_bearish_harami, "Bearish Harami", "空頭母子", "High", 1.055, "green", "black", "bottom"),
-        (options.show_bearish_engulfing, "Bearish Engulfing", "陰吞噬", "High", 1.065, "green", "black", "bottom"),
+        (options.show_morning_star, "Morning Star", "晨星", "Low", 0.992, "#d62828", "white", "top", "bullish"),
+        (options.show_three_white_soldiers, "Three White Soldiers", "紅三兵", "Low", 0.987, "#d62828", "white", "top", "bullish"),
+        (options.show_bullish_engulfing, "Bullish Engulfing", "多頭吞噬", "Low", 0.982, "#d62828", "white", "top", "bullish"),
+        (options.show_hammer, "Hammer", "槌子", "Low", 0.977, "#d62828", "white", "top", "bullish"),
+        (options.show_bullish_harami, "Bullish Harami", "多頭母子", "Low", 0.972, "#d62828", "white", "top", "bullish"),
+        (options.show_bullish_harami_cross, "Bullish Harami Cross", "多頭母子十字", "Low", 0.967, "#d62828", "white", "top", "bullish"),
+        (options.show_evening_star, "Evening Star", "暮星", "High", 1.008, "#2f9e44", "white", "bottom", "bearish"),
+        (options.show_shooting_star, "Shooting Star", "射擊之星", "High", 1.013, "#2f9e44", "white", "bottom", "bearish"),
+        (options.show_three_black_crows, "Three Black Crows", "黑三鴉", "High", 1.018, "#2f9e44", "white", "bottom", "bearish"),
+        (options.show_hanging_man, "Hanging Man", "吊人線", "High", 1.023, "#2f9e44", "white", "bottom", "bearish"),
+        (options.show_meteor, "Meteor", "流星", "High", 1.028, "#2f9e44", "white", "bottom", "bearish"),
+        (options.show_bearish_harami, "Bearish Harami", "空頭母子", "High", 1.033, "#2f9e44", "white", "bottom", "bearish"),
+        (options.show_bearish_engulfing, "Bearish Engulfing", "陰吞噬", "High", 1.038, "#2f9e44", "white", "bottom", "bearish"),
     ]
-    for show, col, label, pos, offset, bg_color, font_color, yanchor in label_pattern_configs:
+    for show, col, label, pos, offset, bg_color, font_color, yanchor, _pattern_side in label_pattern_configs:
         if show:
             sigs = data[data[col]]
             for x_value, row in sigs.iterrows():
@@ -653,6 +722,7 @@ def draw_chart(data: pd.DataFrame, options: ChartOptions):
                     bgcolor=bg_color,
                     bordercolor=bg_color,
                     borderpad=3,
+                    opacity=0.95,
                     font=dict(color=font_color, size=11),
                     yanchor=yanchor,
                     xref="x",
@@ -691,6 +761,7 @@ def draw_chart(data: pd.DataFrame, options: ChartOptions):
         xaxis_rangeslider_visible=False,
         hovermode="x unified",
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+        margin=dict(l=20, r=20, t=70, b=60),
     )
     fig.update_yaxes(title_text="價格", row=1, col=1)
     fig.update_yaxes(title_text="成交量", row=2, col=1)
@@ -1088,6 +1159,442 @@ def format_compact_date(value: object) -> str:
     return raw
 
 
+def normalize_etf_code(value: str) -> str:
+    return (value or "").strip().upper()
+
+
+def strip_html(value: str) -> str:
+    text = re.sub(r"<[^>]+>", " ", value or "")
+    text = html_lib.unescape(text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def parse_numeric_text(value: object, default: float = 0.0) -> float:
+    text = str(value or "").replace(",", "").replace("%", "").replace("+", "").strip()
+    if text in ("", "-", "--", "N/A"):
+        return default
+    try:
+        return float(text)
+    except ValueError:
+        return default
+
+
+def parse_int_text(value: object, default: int = 0) -> int:
+    return int(round(parse_numeric_text(value, float(default))))
+
+
+def exception_message(exc: Exception) -> str:
+    text = str(exc).strip()
+    return text or repr(exc) or exc.__class__.__name__
+
+
+def get_secret_section(name: str) -> dict:
+    try:
+        section = st.secrets.get(name, {})
+    except (FileNotFoundError, KeyError, AttributeError):
+        return {}
+    return dict(section) if hasattr(section, "items") else {}
+
+
+def active_etf_google_sheet_id() -> str:
+    return str(get_secret_section("active_etf").get("spreadsheet_id", "")).strip()
+
+
+def active_etf_uses_google_sheets() -> bool:
+    return bool(active_etf_google_sheet_id() and get_secret_section("gcp_service_account") and gspread and Credentials)
+
+
+def active_etf_storage_label() -> str:
+    if active_etf_uses_google_sheets():
+        return "Google Sheets"
+    if active_etf_google_sheet_id() and not get_secret_section("gcp_service_account"):
+        return "本機 JSON（尚未讀到 gcp_service_account）"
+    if active_etf_google_sheet_id() and (not gspread or not Credentials):
+        return "本機 JSON（尚未安裝 gspread/google-auth）"
+    return "本機 JSON"
+
+
+def active_etf_storage_diagnostics() -> list[str]:
+    diagnostics = []
+    service_account_info = get_secret_section("gcp_service_account")
+    if not active_etf_google_sheet_id():
+        diagnostics.append("尚未讀到 st.secrets['active_etf']['spreadsheet_id']")
+    if not service_account_info:
+        diagnostics.append("尚未讀到 st.secrets['gcp_service_account']")
+    elif service_account_info.get("client_email"):
+        diagnostics.append(f"請確認 Google Sheet 已分享給：{service_account_info.get('client_email')}，權限需為編輯者")
+    if not gspread:
+        diagnostics.append("尚未安裝 gspread")
+    if not Credentials:
+        diagnostics.append("尚未安裝 google-auth")
+    if not diagnostics:
+        diagnostics.append("Google Sheets 設定已讀取，若仍寫入失敗，請檢查 Sheet 是否已分享給 service account 並給編輯權限。")
+    if not active_etf_uses_google_sheets():
+        diagnostics.append(f"本機 JSON 主要路徑：{ACTIVE_ETF_STATE_PATH}")
+        diagnostics.append(f"本機 JSON 備援路徑：{ACTIVE_ETF_FALLBACK_STATE_PATH}")
+    return diagnostics
+
+
+def local_active_etf_state_paths() -> list[Path]:
+    return [ACTIVE_ETF_STATE_PATH, ACTIVE_ETF_FALLBACK_STATE_PATH]
+
+
+@st.cache_resource(show_spinner=False)
+def get_active_etf_spreadsheet(spreadsheet_id: str):
+    if not gspread or not Credentials:
+        raise RuntimeError("缺少 gspread 或 google-auth 套件，無法使用 Google Sheets 儲存。")
+    service_account_info = get_secret_section("gcp_service_account")
+    if not service_account_info:
+        raise RuntimeError("尚未設定 st.secrets['gcp_service_account']。")
+    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+    credentials = Credentials.from_service_account_info(service_account_info, scopes=scopes)
+    client = gspread.authorize(credentials)
+    return client.open_by_key(spreadsheet_id)
+
+
+def get_or_create_worksheet(spreadsheet, title: str, rows: int = 1000, cols: int = 20):
+    try:
+        return spreadsheet.worksheet(title)
+    except gspread.WorksheetNotFound:
+        return spreadsheet.add_worksheet(title=title, rows=rows, cols=cols)
+
+
+def worksheet_records(worksheet) -> list[dict]:
+    rows = worksheet.get_all_records()
+    return rows if isinstance(rows, list) else []
+
+
+def load_active_etf_state_from_google_sheets() -> dict:
+    spreadsheet = get_active_etf_spreadsheet(active_etf_google_sheet_id())
+    watchlist_sheet = get_or_create_worksheet(spreadsheet, ACTIVE_ETF_WATCHLIST_SHEET, rows=200, cols=2)
+    snapshot_sheet = get_or_create_worksheet(spreadsheet, ACTIVE_ETF_SNAPSHOTS_SHEET, rows=5000, cols=12)
+
+    watchlist_rows = worksheet_records(watchlist_sheet)
+    if watchlist_rows:
+        watchlist = [
+            normalize_etf_code(row.get("etf_code"))
+            for row in watchlist_rows
+            if normalize_etf_code(row.get("etf_code"))
+        ]
+    else:
+        raw_values = watchlist_sheet.get_all_values()
+        watchlist = [
+            normalize_etf_code(row[0])
+            for row in raw_values[1:]
+            if row and normalize_etf_code(row[0])
+        ]
+
+    history: dict[str, list[dict]] = {}
+    for row in worksheet_records(snapshot_sheet):
+        etf_code = normalize_etf_code(row.get("etf_code"))
+        snapshot_date = str(row.get("snapshot_date", "")).strip()
+        if not etf_code or not snapshot_date:
+            continue
+
+        snapshots = history.setdefault(etf_code, [])
+        snapshot = next((item for item in snapshots if item.get("date") == snapshot_date), None)
+        if snapshot is None:
+            snapshot = {
+                "code": etf_code,
+                "name": str(row.get("etf_name", "")).strip() or etf_code,
+                "date": snapshot_date,
+                "holdings": [],
+            }
+            snapshots.append(snapshot)
+
+        snapshot["holdings"].append(
+            {
+                "stock_code": str(row.get("stock_code", "")).strip(),
+                "stock_name": str(row.get("stock_name", "")).strip(),
+                "change_percent": parse_numeric_text(row.get("change_percent")),
+                "close_price": parse_numeric_text(row.get("close_price")),
+                "weight_percent": parse_numeric_text(row.get("weight_percent")),
+                "shares": parse_int_text(row.get("shares")),
+                "contribution_percent": parse_numeric_text(row.get("contribution_percent")),
+            }
+        )
+
+    for snapshots in history.values():
+        snapshots.sort(key=lambda item: item.get("date", ""))
+
+    return {"watchlist": sorted(set(watchlist)), "history": history}
+
+
+def save_active_etf_state_to_google_sheets(state: dict) -> tuple[bool, str]:
+    try:
+        spreadsheet = get_active_etf_spreadsheet(active_etf_google_sheet_id())
+        watchlist_sheet = get_or_create_worksheet(spreadsheet, ACTIVE_ETF_WATCHLIST_SHEET, rows=200, cols=2)
+        snapshot_sheet = get_or_create_worksheet(spreadsheet, ACTIVE_ETF_SNAPSHOTS_SHEET, rows=5000, cols=12)
+        meta_sheet = get_or_create_worksheet(spreadsheet, ACTIVE_ETF_META_SHEET, rows=200, cols=5)
+
+        watchlist_values = [["etf_code", "updated_at"]]
+        updated_at = dt.datetime.now().isoformat(timespec="seconds")
+        for code in sorted(set(state.get("watchlist", []))):
+            watchlist_values.append([code, updated_at])
+        watchlist_sheet.clear()
+        watchlist_sheet.update(values=watchlist_values, range_name="A1")
+
+        snapshot_values = [ACTIVE_ETF_SNAPSHOT_COLUMNS]
+        meta_values = [["etf_code", "etf_name", "latest_snapshot_date", "snapshot_count", "holding_count"]]
+        for etf_code, snapshots in sorted(state.get("history", {}).items()):
+            clean_snapshots = sorted(snapshots, key=lambda item: item.get("date", ""))[-30:]
+            for snapshot in clean_snapshots:
+                for holding in snapshot.get("holdings", []):
+                    snapshot_values.append(
+                        [
+                            snapshot.get("code", etf_code),
+                            snapshot.get("name", ""),
+                            snapshot.get("date", ""),
+                            holding.get("stock_code", ""),
+                            holding.get("stock_name", ""),
+                            holding.get("change_percent", 0.0),
+                            holding.get("close_price", 0.0),
+                            holding.get("weight_percent", 0.0),
+                            holding.get("shares", 0),
+                            holding.get("contribution_percent", 0.0),
+                        ]
+                    )
+            if clean_snapshots:
+                latest = clean_snapshots[-1]
+                meta_values.append(
+                    [
+                        etf_code,
+                        latest.get("name", ""),
+                        latest.get("date", ""),
+                        len(clean_snapshots),
+                        len(latest.get("holdings", [])),
+                    ]
+                )
+
+        snapshot_sheet.clear()
+        snapshot_sheet.update(values=snapshot_values, range_name="A1")
+        meta_sheet.clear()
+        meta_sheet.update(values=meta_values, range_name="A1")
+        return True, ""
+    except PermissionError as exc:
+        return False, (
+            f"PermissionError: {exception_message(exc)}。"
+            "請確認 Google Sheet 已分享給 service account 的 client_email，且權限為編輯者。"
+        )
+    except Exception as exc:
+        return False, f"{exc.__class__.__name__}: {exception_message(exc)}"
+
+
+def load_active_etf_state() -> dict:
+    default_state = {"watchlist": [], "history": {}}
+    if active_etf_uses_google_sheets():
+        try:
+            return load_active_etf_state_from_google_sheets()
+        except Exception:
+            return default_state
+
+    data = None
+    for path in local_active_etf_state_paths():
+        if not path.exists():
+            continue
+        try:
+            with path.open("r", encoding="utf-8") as file:
+                data = json.load(file)
+            break
+        except (OSError, json.JSONDecodeError):
+            continue
+    if data is None:
+        return default_state
+
+    watchlist = [normalize_etf_code(code) for code in data.get("watchlist", []) if normalize_etf_code(code)]
+    history = data.get("history", {})
+    if not isinstance(history, dict):
+        history = {}
+    return {"watchlist": watchlist, "history": history}
+
+
+def save_active_etf_state(state: dict) -> tuple[bool, str]:
+    if active_etf_uses_google_sheets():
+        return save_active_etf_state_to_google_sheets(state)
+
+    errors = []
+    for path in local_active_etf_state_paths():
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("w", encoding="utf-8") as file:
+                json.dump(state, file, ensure_ascii=False, indent=2)
+            return True, ""
+        except OSError as exc:
+            errors.append(f"{path}: {exc.__class__.__name__}: {exception_message(exc)}")
+
+    return False, "；".join(errors)
+
+
+def fetch_etfinfo_html(etf_code: str) -> str:
+    url = ETFINFO_HOLDINGS_URL.format(code=urllib.parse.quote(normalize_etf_code(etf_code)))
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": KGI_USER_AGENT,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        },
+    )
+    context = ssl._create_unverified_context()
+    with urllib.request.urlopen(request, timeout=20, context=context) as response:
+        return response.read().decode("utf-8", errors="ignore")
+
+
+def parse_etf_holdings_html(etf_code: str, page_html: str) -> dict:
+    code = normalize_etf_code(etf_code)
+    title_match = re.search(r"<title>(.*?)</title>", page_html, re.S)
+    title_text = strip_html(title_match.group(1)) if title_match else ""
+    name_match = re.search(rf"{re.escape(code)}\s+(.+?)\s+成分股", title_text)
+    etf_name = name_match.group(1).strip() if name_match else code
+
+    date_match = re.search(r"快照\s*(\d{4}-\d{2}-\d{2})", page_html)
+    if not date_match:
+        date_match = re.search(r"(\d{4}-\d{2}-\d{2})", title_text)
+    snapshot_date = date_match.group(1) if date_match else dt.date.today().isoformat()
+
+    holdings = []
+    rows = re.findall(r'<tr[^>]*class="[^"]*\bholding-row\b[^"]*"[^>]*>(.*?)</tr>', page_html, re.S)
+    for row_html in rows:
+        stock_code_match = re.search(r'class="stock-code-link"[^>]*>(.*?)</a>', row_html, re.S)
+        stock_name_match = re.search(r'class="stock-name-sub"[^>]*>(.*?)</span>', row_html, re.S)
+        if not stock_code_match:
+            continue
+
+        cells = re.findall(r"<td([^>]*)>(.*?)</td>", row_html, re.S)
+        desktop_values = []
+        contribution = 0.0
+        for attrs, inner in cells:
+            class_match = re.search(r'class="([^"]*)"', attrs)
+            class_text = class_match.group(1) if class_match else ""
+            clean_value = strip_html(inner)
+            if "hide-mobile" in class_text and "hide-desktop" not in class_text:
+                desktop_values.append(clean_value)
+            elif "cell-number" in class_text and "hide-mobile" not in class_text and "hide-desktop" not in class_text:
+                contribution = parse_numeric_text(clean_value)
+
+        change_pct = parse_numeric_text(desktop_values[0]) if len(desktop_values) > 0 else 0.0
+        close_price = parse_numeric_text(desktop_values[1]) if len(desktop_values) > 1 else 0.0
+        weight_pct = parse_numeric_text(desktop_values[2]) if len(desktop_values) > 2 else 0.0
+        shares = parse_int_text(desktop_values[3]) if len(desktop_values) > 3 else 0
+
+        holdings.append(
+            {
+                "stock_code": strip_html(stock_code_match.group(1)),
+                "stock_name": strip_html(stock_name_match.group(1)) if stock_name_match else "",
+                "change_percent": change_pct,
+                "close_price": close_price,
+                "weight_percent": weight_pct,
+                "shares": shares,
+                "contribution_percent": contribution,
+            }
+        )
+
+    if not holdings:
+        raise ValueError("抓到頁面但解析不到持股表格，可能是資料來源版型已變更。")
+
+    return {"code": code, "name": etf_name, "date": snapshot_date, "holdings": holdings}
+
+
+def fetch_etf_holdings_snapshot(etf_code: str) -> dict:
+    page_html = fetch_etfinfo_html(etf_code)
+    return parse_etf_holdings_html(etf_code, page_html)
+
+
+def upsert_etf_snapshot(state: dict, snapshot: dict) -> None:
+    code = snapshot["code"]
+    history = state.setdefault("history", {}).setdefault(code, [])
+    history = [item for item in history if item.get("date") != snapshot.get("date")]
+    history.append(snapshot)
+    history.sort(key=lambda item: item.get("date", ""))
+    state["history"][code] = history[-30:]
+
+
+def previous_etf_snapshot(state: dict, etf_code: str, current_date: str) -> dict | None:
+    history = state.get("history", {}).get(normalize_etf_code(etf_code), [])
+    previous_items = [item for item in history if item.get("date", "") < current_date]
+    if previous_items:
+        return sorted(previous_items, key=lambda item: item.get("date", ""))[-1]
+    return None
+
+
+def build_etf_change_rows(current_snapshot: dict, previous_snapshot: dict | None) -> list[dict]:
+    current_map = {item["stock_code"]: item for item in current_snapshot.get("holdings", [])}
+    previous_map = {
+        item["stock_code"]: item
+        for item in (previous_snapshot or {}).get("holdings", [])
+    }
+    rows = []
+
+    for stock_code, current in current_map.items():
+        previous = previous_map.get(stock_code, {})
+        current_shares = int(current.get("shares", 0))
+        previous_shares = int(previous.get("shares", 0))
+        delta = current_shares - previous_shares
+        if not previous:
+            action = "新增"
+        elif delta > 0:
+            action = "加碼"
+        elif delta < 0:
+            action = "減碼"
+        else:
+            action = "持平"
+
+        rows.append(
+            {
+                "ETF": f"{current_snapshot['code']} {current_snapshot.get('name', '')}",
+                "快照日": current_snapshot.get("date", ""),
+                "動作": action,
+                "股票代號": stock_code,
+                "名稱": current.get("stock_name", ""),
+                "股數變化": delta,
+                "目前股數": current_shares,
+                "前次股數": previous_shares,
+                "權重%": round(float(current.get("weight_percent", 0.0)), 2),
+                "收盤價": round(float(current.get("close_price", 0.0)), 2),
+                "漲跌幅%": round(float(current.get("change_percent", 0.0)), 2),
+            }
+        )
+
+    for stock_code, previous in previous_map.items():
+        if stock_code in current_map:
+            continue
+        previous_shares = int(previous.get("shares", 0))
+        rows.append(
+            {
+                "ETF": f"{current_snapshot['code']} {current_snapshot.get('name', '')}",
+                "快照日": current_snapshot.get("date", ""),
+                "動作": "刪除",
+                "股票代號": stock_code,
+                "名稱": previous.get("stock_name", ""),
+                "股數變化": -previous_shares,
+                "目前股數": 0,
+                "前次股數": previous_shares,
+                "權重%": 0.0,
+                "收盤價": round(float(previous.get("close_price", 0.0)), 2),
+                "漲跌幅%": round(float(previous.get("change_percent", 0.0)), 2),
+            }
+        )
+
+    action_order = {"新增": 0, "加碼": 1, "減碼": 2, "刪除": 3, "持平": 4}
+    return sorted(rows, key=lambda item: (action_order.get(item["動作"], 9), -abs(item["股數變化"])))
+
+
+def etf_holdings_dataframe(snapshot: dict) -> pd.DataFrame:
+    rows = []
+    for item in snapshot.get("holdings", []):
+        rows.append(
+            {
+                "股票代號": item.get("stock_code", ""),
+                "名稱": item.get("stock_name", ""),
+                "持股張數": round(parse_numeric_text(item.get("shares")) / 1000, 2),
+                "持股股數": int(item.get("shares", 0)),
+                "權重%": round(float(item.get("weight_percent", 0.0)), 2),
+                "收盤價": round(float(item.get("close_price", 0.0)), 2),
+                "漲跌幅%": round(float(item.get("change_percent", 0.0)), 2),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 def init_home_state() -> None:
     st.session_state.setdefault("app_section", "home")
     st.session_state.setdefault("query_text", "")
@@ -1106,6 +1613,10 @@ def init_home_state() -> None:
     st.session_state.setdefault("recommend_custom_execrate", 0.005)
     st.session_state.setdefault("recommend_custom_leverage", 2.0)
     st.session_state.setdefault("recommend_custom_volume", 100.0)
+    st.session_state.setdefault("active_etf_state", load_active_etf_state())
+    st.session_state.setdefault("active_etf_new_code", "")
+    st.session_state.setdefault("active_etf_latest_changes", None)
+    st.session_state.setdefault("active_etf_last_errors", [])
 
 
 def clear_loaded_warrant() -> None:
@@ -1333,23 +1844,28 @@ def go_to(section: str) -> None:
 
 def render_home() -> None:
     st.title("投資工具首頁")
-    st.caption("這支程式同時包含 K 線型態分析、權證計算機與權證推薦，之後可直接部署到 GitHub 與 Streamlit Community Cloud。")
-    left, middle, right = st.columns(3)
+    st.caption("這支程式同時包含 K 線型態分析、權證計算機、權證推薦與主動 ETF 持股追蹤，之後可直接部署到 GitHub 與 Streamlit Community Cloud。")
+    left, middle_left, middle_right, right = st.columns(4)
     with left:
         st.markdown("### K線型態分析")
         st.write("查看台股 K 線、技術指標、型態訊號與 AI 分析。")
         if st.button("前往 K線型態分析", type="primary", use_container_width=True):
             go_to("stock2")
-    with middle:
+    with middle_left:
         st.markdown("### 權證計算機")
         st.write("使用凱基 backend service 查詢權證資料與試算參考價格。")
         if st.button("前往 權證計算機", type="primary", use_container_width=True):
             go_to("warrant")
-    with right:
+    with middle_right:
         st.markdown("### 權證推薦")
         st.write("依標的篩選認購權證，優先找長天期、較高行使比例與較佳交易條件。")
         if st.button("前往 權證推薦", type="primary", use_container_width=True):
             go_to("recommend")
+    with right:
+        st.markdown("### 主動ETF追蹤")
+        st.write("新增台灣主動型 ETF，盤後追蹤每日持股進出與股數變化。")
+        if st.button("前往 主動ETF追蹤", type="primary", use_container_width=True):
+            go_to("active_etf")
 
 
 def render_warrant_calculator() -> None:
@@ -1663,6 +2179,131 @@ def render_warrant_recommendation() -> None:
     st.subheader("前 10 檔候選")
     st.dataframe(recommend_df, use_container_width=True, hide_index=True)
 
+
+def render_active_etf_tracker() -> None:
+    st.title("台灣主動型 ETF 持股追蹤")
+    st.caption("新增要追蹤的主動型 ETF 代號，盤後按「更新全部」即可抓取最新持股，並與前一次快照比對股數進出。")
+    st.caption(f"目前儲存位置：{active_etf_storage_label()}")
+    with st.expander("儲存設定檢查", expanded=False):
+        for item in active_etf_storage_diagnostics():
+            st.write(f"- {item}")
+
+    state = st.session_state.setdefault("active_etf_state", load_active_etf_state())
+    state.setdefault("watchlist", [])
+    state.setdefault("history", {})
+
+    with st.container(border=True):
+        st.subheader("追蹤清單")
+        add_col, add_button_col = st.columns([0.75, 0.25])
+        with add_col:
+            new_code = st.text_input(
+                "新增 ETF 代號",
+                placeholder="例如：00403A",
+                key="active_etf_new_code",
+            )
+        with add_button_col:
+            st.write("")
+            st.write("")
+            if st.button("新增ETF", type="primary", use_container_width=True):
+                code = normalize_etf_code(new_code)
+                if not code:
+                    st.warning("請先輸入 ETF 代號。")
+                elif code in state["watchlist"]:
+                    st.info(f"{code} 已在追蹤清單中。")
+                else:
+                    state["watchlist"].append(code)
+                    state["watchlist"] = sorted(set(state["watchlist"]))
+                    ok, message = save_active_etf_state(state)
+                    if not ok:
+                        st.warning(f"清單已加入本次 session，但寫入狀態檔失敗：{message}")
+                    st.session_state["active_etf_state"] = state
+                    st.rerun()
+
+        if state["watchlist"]:
+            st.write("目前追蹤：")
+            st.dataframe(pd.DataFrame({"ETF代號": state["watchlist"]}), use_container_width=True, hide_index=True)
+            remove_codes = st.multiselect("選擇要刪除的 ETF", options=state["watchlist"])
+            if st.button("刪除選取", use_container_width=True):
+                if not remove_codes:
+                    st.info("請先選擇要刪除的 ETF。")
+                else:
+                    state["watchlist"] = [code for code in state["watchlist"] if code not in remove_codes]
+                    ok, message = save_active_etf_state(state)
+                    if not ok:
+                        st.warning(f"已從本次 session 移除，但寫入狀態檔失敗：{message}")
+                    st.session_state["active_etf_state"] = state
+                    st.rerun()
+        else:
+            st.info("目前尚未加入 ETF。請先輸入代號，例如 00403A。")
+
+    if not state["watchlist"]:
+        return
+
+    refresh_col, info_col = st.columns([0.25, 0.75])
+    with refresh_col:
+        refresh_clicked = st.button("更新全部並比對", type="primary", use_container_width=True)
+    with info_col:
+        st.caption("資料來源為 ETF 資訊網公開持股頁。若當天資料尚未更新，會抓到來源網站目前最新快照日。")
+
+    if refresh_clicked:
+        all_change_rows = []
+        errors = []
+        with st.spinner("正在抓取 ETF 持股並比對前次快照..."):
+            for etf_code in state["watchlist"]:
+                try:
+                    snapshot = fetch_etf_holdings_snapshot(etf_code)
+                    previous = previous_etf_snapshot(state, etf_code, snapshot["date"])
+                    change_rows = build_etf_change_rows(snapshot, previous)
+                    if previous:
+                        all_change_rows.extend([row for row in change_rows if row["動作"] != "持平"])
+                    else:
+                        all_change_rows.extend(change_rows)
+                    upsert_etf_snapshot(state, snapshot)
+                except (urllib.error.URLError, TimeoutError, ValueError, OSError) as exc:
+                    errors.append(f"{etf_code}: {exc}")
+
+        ok, message = save_active_etf_state(state)
+        if not ok:
+            errors.append(f"狀態檔寫入失敗：{message}")
+        st.session_state["active_etf_state"] = state
+        st.session_state["active_etf_latest_changes"] = all_change_rows
+        st.session_state["active_etf_last_errors"] = errors
+
+    errors = st.session_state.get("active_etf_last_errors") or []
+    if errors:
+        st.error("部分 ETF 更新失敗：\n\n" + "\n".join(f"- {message}" for message in errors))
+
+    latest_changes = st.session_state.get("active_etf_latest_changes")
+    if latest_changes is not None:
+        st.subheader("本次持股變化總覽")
+        if latest_changes:
+            changes_df = pd.DataFrame(latest_changes)
+            st.dataframe(
+                changes_df,
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.info("本次更新沒有偵測到持股股數變化。")
+
+    st.subheader("最新持股快照")
+    for etf_code in state["watchlist"]:
+        history = state.get("history", {}).get(etf_code, [])
+        if not history:
+            with st.expander(f"{etf_code} 尚未更新"):
+                st.info("按「更新全部並比對」後，這裡會顯示最新持股。")
+            continue
+
+        latest_snapshot = sorted(history, key=lambda item: item.get("date", ""))[-1]
+        label = f"{etf_code} {latest_snapshot.get('name', '')} / 快照日 {latest_snapshot.get('date', '')}"
+        with st.expander(label, expanded=False):
+            holdings_df = etf_holdings_dataframe(latest_snapshot)
+            metric_cols = st.columns(3)
+            metric_cols[0].metric("持股檔數", f"{len(holdings_df)}")
+            metric_cols[1].metric("最大權重", f"{holdings_df['權重%'].max():.2f}%" if not holdings_df.empty else "-")
+            metric_cols[2].metric("歷史快照數", f"{len(history)}")
+            st.dataframe(holdings_df, use_container_width=True, hide_index=True)
+
 # -----------------------------
 # 主介面
 # -----------------------------
@@ -1701,6 +2342,8 @@ def render_stock2_tool():
         ms_on = is_pattern_selected(selected_patterns, "Morning Star (晨星)")
         es_on = is_pattern_selected(selected_patterns, "Evening Star (暮星)")
         ss_on = is_pattern_selected(selected_patterns, "Shooting Star (射擊之星)")
+        tws_on = is_pattern_selected(selected_patterns, "Three White Soldiers (紅三兵)")
+        tbc_on = is_pattern_selected(selected_patterns, "Three Black Crows (黑三鴉)")
         be_on = is_pattern_selected(selected_patterns, "Bullish Engulfing (多頭吞噬)")
         hammer_on = is_pattern_selected(selected_patterns, "Hammer (槌子)")
         hanging_on = is_pattern_selected(selected_patterns, "Hanging Man (吊人線)")
@@ -1732,6 +2375,8 @@ def render_stock2_tool():
                 ms_on,
                 es_on,
                 ss_on,
+                tws_on,
+                tbc_on,
                 be_on,
                 hammer_on,
                 hanging_on,
@@ -1810,6 +2455,8 @@ def main():
         render_warrant_calculator()
     elif current == "recommend":
         render_warrant_recommendation()
+    elif current == "active_etf":
+        render_active_etf_tracker()
     else:
         render_home()
 
