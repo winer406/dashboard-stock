@@ -82,19 +82,27 @@ ACTIVE_ETF_SNAPSHOT_COLUMNS = [
 PATTERN_SELECT_ALL = "全選"
 PATTERN_CHOICES = (
     PATTERN_SELECT_ALL,
+    "Red Candle (紅K/陽線)",
+    "Black Candle (黑K/陰線)",
+    "Doji (十字線)",
     "Morning Star (晨星)",
     "Evening Star (暮星)",
     "Shooting Star (射擊之星)",
     "Three White Soldiers (紅三兵)",
     "Three Black Crows (黑三鴉)",
     "Bullish Engulfing (多頭吞噬)",
+    "Piercing Line (穿刺線)",
     "Hammer (槌子)",
     "Hanging Man (吊人線)",
     "Meteor (流星)",
     "Bullish Harami (多頭母子)",
     "Bullish Harami Cross (多頭母子十字)",
+    "Sandwich (三明治)",
+    "Ladder Bottom (梯底)",
     "Bearish Harami (空頭母子)",
     "Bearish Engulfing (陰吞噬)",
+    "Dark Cloud Cover (烏雲罩頂)",
+    "On Neck Line (頸上線)",
 )
 
 @dataclass
@@ -106,19 +114,27 @@ class ChartOptions:
     show_kd: bool
     show_rsi: bool
     show_macd: bool
+    show_red_candle: bool
+    show_black_candle: bool
+    show_doji: bool
     show_morning_star: bool
     show_evening_star: bool
     show_shooting_star: bool
     show_three_white_soldiers: bool
     show_three_black_crows: bool
     show_bullish_engulfing: bool
+    show_piercing_line: bool
     show_hammer: bool
     show_hanging_man: bool
     show_meteor: bool
     show_bullish_harami: bool
     show_bullish_harami_cross: bool
+    show_sandwich: bool
+    show_ladder_bottom: bool
     show_bearish_harami: bool
     show_bearish_engulfing: bool
+    show_dark_cloud_cover: bool
+    show_on_neck_line: bool
 
 
 def safe_float(value, default: float = 0.0) -> float:
@@ -132,6 +148,35 @@ def safe_float(value, default: float = 0.0) -> float:
 # -----------------------------
 # 形態偵測函式
 # -----------------------------
+def candle_body(candle: pd.Series) -> float:
+    return abs(candle["Close"] - candle["Open"])
+
+
+def candle_range(candle: pd.Series) -> float:
+    return max(candle["High"] - candle["Low"], 0.001)
+
+
+def candle_mid_body(candle: pd.Series) -> float:
+    return (candle["Open"] + candle["Close"]) / 2
+
+
+def detect_red_candle(data: pd.DataFrame) -> pd.Series:
+    """紅K / 陽線：收盤高於開盤。"""
+    return data["Close"] > data["Open"]
+
+
+def detect_black_candle(data: pd.DataFrame) -> pd.Series:
+    """黑K / 陰線：收盤低於開盤。"""
+    return data["Close"] < data["Open"]
+
+
+def detect_doji(data: pd.DataFrame) -> pd.Series:
+    """十字線：開盤與收盤接近，代表多空拉鋸。"""
+    body = (data["Close"] - data["Open"]).abs()
+    total_range = (data["High"] - data["Low"]).replace(0, pd.NA)
+    return (body <= total_range * 0.1).fillna(False)
+
+
 def detect_morning_star(data: pd.DataFrame) -> pd.Series:
     """晨星：看漲反轉（大陰、跳空小實體、大陽）"""
     signals = pd.Series(False, index=data.index)
@@ -248,6 +293,45 @@ def detect_bearish_engulfing(data: pd.DataFrame) -> pd.Series:
         signals.iloc[i] = prev_bullish and curr_bearish and engulfs_body
     return signals
 
+
+def detect_piercing_line(data: pd.DataFrame) -> pd.Series:
+    """穿刺線：前長黑、後紅K收回前黑實體中線以上，偏多頭反轉。"""
+    signals = pd.Series(False, index=data.index)
+    for i in range(1, len(data)):
+        prev, curr = data.iloc[i - 1], data.iloc[i]
+        prev_body = candle_body(prev)
+        prev_range = candle_range(prev)
+        is_signal = (
+            prev["Close"] < prev["Open"]
+            and prev_body >= prev_range * 0.45
+            and curr["Close"] > curr["Open"]
+            and curr["Open"] <= prev["Close"] * 1.01
+            and curr["Close"] > candle_mid_body(prev)
+            and curr["Close"] < prev["Open"]
+        )
+        signals.iloc[i] = is_signal
+    return signals
+
+
+def detect_dark_cloud_cover(data: pd.DataFrame) -> pd.Series:
+    """烏雲罩頂：前長紅、後黑K跌回前紅實體中線以下，偏空頭反轉。"""
+    signals = pd.Series(False, index=data.index)
+    for i in range(1, len(data)):
+        prev, curr = data.iloc[i - 1], data.iloc[i]
+        prev_body = candle_body(prev)
+        prev_range = candle_range(prev)
+        is_signal = (
+            prev["Close"] > prev["Open"]
+            and prev_body >= prev_range * 0.45
+            and curr["Close"] < curr["Open"]
+            and curr["Open"] >= prev["Close"] * 0.99
+            and curr["Close"] < candle_mid_body(prev)
+            and curr["Close"] > prev["Open"]
+        )
+        signals.iloc[i] = is_signal
+    return signals
+
+
 def is_body_inside_previous(prev: pd.Series, curr: pd.Series) -> bool:
     prev_body_low = min(prev["Open"], prev["Close"])
     prev_body_high = max(prev["Open"], prev["Close"])
@@ -343,6 +427,56 @@ def detect_hanging_man(data: pd.DataFrame) -> pd.Series:
 def detect_meteor(data: pd.DataFrame) -> pd.Series:
     """流星：小實體、長上影線、下影線短，偏看跌警訊"""
     return detect_shooting_star(data)
+
+
+def detect_sandwich(data: pd.DataFrame) -> pd.Series:
+    """三明治：黑紅黑，前後黑K收盤接近，低檔支撐被反覆測試。"""
+    signals = pd.Series(False, index=data.index)
+    for i in range(2, len(data)):
+        first, second, third = data.iloc[i - 2], data.iloc[i - 1], data.iloc[i]
+        similar_close = abs(first["Close"] - third["Close"]) <= max(first["Close"] * 0.015, 0.01)
+        is_signal = (
+            first["Close"] < first["Open"]
+            and second["Close"] > second["Open"]
+            and third["Close"] < third["Open"]
+            and similar_close
+            and third["Close"] >= min(first["Low"], second["Low"]) * 0.995
+        )
+        signals.iloc[i] = is_signal
+    return signals
+
+
+def detect_ladder_bottom(data: pd.DataFrame) -> pd.Series:
+    """梯底：連續下跌後低檔出現紅K反攻，偏多頭反轉。"""
+    signals = pd.Series(False, index=data.index)
+    for i in range(4, len(data)):
+        c1, c2, c3, c4, c5 = data.iloc[i - 4], data.iloc[i - 3], data.iloc[i - 2], data.iloc[i - 1], data.iloc[i]
+        first_three_bearish = all(candle["Close"] < candle["Open"] for candle in (c1, c2, c3))
+        closes_falling = c1["Close"] > c2["Close"] > c3["Close"]
+        fourth_stabilizes = c4["Low"] <= c3["Low"] and c4["Close"] >= c3["Close"] * 0.98
+        fifth_reversal = c5["Close"] > c5["Open"] and c5["Close"] > max(c3["Open"], c4["High"])
+        signals.iloc[i] = first_three_bearish and closes_falling and fourth_stabilizes and fifth_reversal
+    return signals
+
+
+def detect_on_neck_line(data: pd.DataFrame) -> pd.Series:
+    """頸上線：下跌後小反彈僅收回前一根低檔附近，偏空頭延續。"""
+    signals = pd.Series(False, index=data.index)
+    for i in range(1, len(data)):
+        prev, curr = data.iloc[i - 1], data.iloc[i]
+        prev_body = candle_body(prev)
+        prev_range = candle_range(prev)
+        close_near_prev_close = abs(curr["Close"] - prev["Close"]) <= max(prev["Close"] * 0.015, 0.01)
+        is_signal = (
+            prev["Close"] < prev["Open"]
+            and prev_body >= prev_range * 0.45
+            and curr["Close"] > curr["Open"]
+            and curr["Open"] < prev["Close"]
+            and close_near_prev_close
+            and curr["Close"] < candle_mid_body(prev)
+        )
+        signals.iloc[i] = is_signal
+    return signals
 
 # -----------------------------
 # 資料處理
@@ -593,19 +727,27 @@ def get_stock_data(options: ChartOptions) -> pd.DataFrame:
     data["MACD Histogram"] = data["MACD"] - data["MACD Signal"]
     
     # 偵測形態
+    data["Red Candle"] = detect_red_candle(data)
+    data["Black Candle"] = detect_black_candle(data)
+    data["Doji"] = detect_doji(data)
     data["Morning Star"] = detect_morning_star(data)
     data["Evening Star"] = detect_evening_star(data)
     data["Shooting Star"] = detect_shooting_star(data)
     data["Three White Soldiers"] = detect_three_white_soldiers(data)
     data["Three Black Crows"] = detect_three_black_crows(data)
     data["Bullish Engulfing"] = detect_bullish_engulfing(data)
+    data["Piercing Line"] = detect_piercing_line(data)
     data["Hammer"] = detect_hammer(data)
     data["Hanging Man"] = detect_hanging_man(data)
     data["Meteor"] = detect_meteor(data)
     data["Bullish Harami"] = detect_bullish_harami(data)
     data["Bullish Harami Cross"] = detect_bullish_harami_cross(data)
+    data["Sandwich"] = detect_sandwich(data)
+    data["Ladder Bottom"] = detect_ladder_bottom(data)
     data["Bearish Harami"] = detect_bearish_harami(data)
     data["Bearish Engulfing"] = detect_bearish_engulfing(data)
+    data["Dark Cloud Cover"] = detect_dark_cloud_cover(data)
+    data["On Neck Line"] = detect_on_neck_line(data)
 
     return data.tail(options.display_days)
 
@@ -696,12 +838,18 @@ def draw_chart(data: pd.DataFrame, options: ChartOptions):
         fig.add_trace(go.Scatter(x=data.index, y=data["Lower Band"], name="布林下軌", line=dict(color="orange", dash="dash")), row=1, col=1)
 
     label_pattern_configs = [
+        (options.show_red_candle, "Red Candle", "紅K", "Low", 0.995, "#ef4444", "white", "top", "basic"),
+        (options.show_black_candle, "Black Candle", "黑K", "High", 1.005, "#16a34a", "white", "bottom", "basic"),
+        (options.show_doji, "Doji", "十字線", "High", 1.006, "#64748b", "white", "bottom", "basic"),
         (options.show_morning_star, "Morning Star", "晨星", "Low", 0.992, "#d62828", "white", "top", "bullish"),
         (options.show_three_white_soldiers, "Three White Soldiers", "紅三兵", "Low", 0.987, "#d62828", "white", "top", "bullish"),
         (options.show_bullish_engulfing, "Bullish Engulfing", "多頭吞噬", "Low", 0.982, "#d62828", "white", "top", "bullish"),
-        (options.show_hammer, "Hammer", "槌子", "Low", 0.977, "#d62828", "white", "top", "bullish"),
-        (options.show_bullish_harami, "Bullish Harami", "多頭母子", "Low", 0.972, "#d62828", "white", "top", "bullish"),
-        (options.show_bullish_harami_cross, "Bullish Harami Cross", "多頭母子十字", "Low", 0.967, "#d62828", "white", "top", "bullish"),
+        (options.show_piercing_line, "Piercing Line", "穿刺線", "Low", 0.977, "#d62828", "white", "top", "bullish"),
+        (options.show_hammer, "Hammer", "槌子", "Low", 0.972, "#d62828", "white", "top", "bullish"),
+        (options.show_bullish_harami, "Bullish Harami", "多頭母子", "Low", 0.967, "#d62828", "white", "top", "bullish"),
+        (options.show_bullish_harami_cross, "Bullish Harami Cross", "多頭母子十字", "Low", 0.962, "#d62828", "white", "top", "bullish"),
+        (options.show_sandwich, "Sandwich", "三明治", "Low", 0.957, "#d62828", "white", "top", "bullish"),
+        (options.show_ladder_bottom, "Ladder Bottom", "梯底", "Low", 0.952, "#d62828", "white", "top", "bullish"),
         (options.show_evening_star, "Evening Star", "暮星", "High", 1.008, "#2f9e44", "white", "bottom", "bearish"),
         (options.show_shooting_star, "Shooting Star", "射擊之星", "High", 1.013, "#2f9e44", "white", "bottom", "bearish"),
         (options.show_three_black_crows, "Three Black Crows", "黑三鴉", "High", 1.018, "#2f9e44", "white", "bottom", "bearish"),
@@ -709,6 +857,8 @@ def draw_chart(data: pd.DataFrame, options: ChartOptions):
         (options.show_meteor, "Meteor", "流星", "High", 1.028, "#2f9e44", "white", "bottom", "bearish"),
         (options.show_bearish_harami, "Bearish Harami", "空頭母子", "High", 1.033, "#2f9e44", "white", "bottom", "bearish"),
         (options.show_bearish_engulfing, "Bearish Engulfing", "陰吞噬", "High", 1.038, "#2f9e44", "white", "bottom", "bearish"),
+        (options.show_dark_cloud_cover, "Dark Cloud Cover", "烏雲罩頂", "High", 1.043, "#2f9e44", "white", "bottom", "bearish"),
+        (options.show_on_neck_line, "On Neck Line", "頸上線", "High", 1.048, "#2f9e44", "white", "bottom", "bearish"),
     ]
     for show, col, label, pos, offset, bg_color, font_color, yanchor, _pattern_side in label_pattern_configs:
         if show:
@@ -1863,30 +2013,376 @@ def go_to(section: str) -> None:
     st.rerun()
 
 
+def candle_pattern_library() -> dict[str, list[dict]]:
+    return {
+        "基礎線型": [
+            {
+                "name": "紅K / 陽線",
+                "bias": "多方",
+                "candles": [(100, 112, 96, 110)],
+                "summary": "收盤高於開盤，代表這段時間買方取得優勢。",
+                "watch": "實體越長，表示多方推升越果斷；若搭配放量，訊號更有力。",
+                "confirm": "觀察下一根是否續強，或是否站上壓力區。",
+                "trap": "單根紅K若剛好出現在壓力區，仍可能只是反彈，不宜只看顏色判斷。",
+                "steps": ["開盤後買盤推升，收盤高於開盤，形成紅K實體。"],
+            },
+            {
+                "name": "黑K / 陰線",
+                "bias": "空方",
+                "candles": [(110, 114, 98, 101)],
+                "summary": "收盤低於開盤，代表這段時間賣方取得優勢。",
+                "watch": "實體越長，表示賣壓越明確；若跌破支撐，空方訊號更強。",
+                "confirm": "觀察下一根是否續弱，或反彈是否無法站回支撐。",
+                "trap": "黑K不一定代表當日大跌，仍要看位置、成交量與趨勢。",
+                "steps": ["開盤後賣壓主導，收盤低於開盤，形成黑K實體。"],
+            },
+            {
+                "name": "十字線",
+                "bias": "中性",
+                "candles": [(105, 113, 97, 105.3)],
+                "summary": "開盤與收盤接近，代表多空拉鋸，常出現在轉折前。",
+                "watch": "十字線本身不是買賣訊號，位置比形狀重要。",
+                "confirm": "高檔十字線後跌破低點偏弱，低檔十字線後突破高點偏強。",
+                "trap": "盤整區大量十字線很常見，單獨看容易過度解讀。",
+                "steps": ["價格上下震盪，但收盤回到開盤附近，表示多空暫時平衡。"],
+            },
+        ],
+        "多頭型態": [
+            {
+                "name": "槌子",
+                "bias": "多頭反轉",
+                "candles": [(112, 114, 104, 108), (108, 110, 96, 106), (103, 107, 88, 105)],
+                "summary": "下跌後出現長下影，表示低檔有買盤承接。",
+                "watch": "下影線越長、實體越小，低檔承接意味越明顯。",
+                "confirm": "下一根紅K站上槌子高點，反轉可信度較高。",
+                "trap": "若隔日跌破槌子低點，表示承接失敗。",
+                "steps": ["先有下跌背景。", "盤中被打低，但低檔買盤開始出現。", "收盤拉回實體附近，留下長下影。"],
+            },
+            {
+                "name": "多頭吞噬",
+                "bias": "多頭反轉",
+                "candles": [(112, 113, 105, 107), (106, 116, 104, 115)],
+                "summary": "前一根黑K後，後一根紅K實體吞噬前一根實體，代表買方反攻。",
+                "watch": "吞噬幅度越完整，反轉力道越強。",
+                "confirm": "隔日不跌回吞噬紅K中段以下，較有延續性。",
+                "trap": "若發生在長期高檔，可能只是震盪，不一定是低檔反轉。",
+                "steps": ["第一根黑K延續弱勢。", "第二根開低走高，紅K實體吃掉前一根黑K實體。"],
+            },
+            {
+                "name": "多頭母子",
+                "bias": "多頭反轉",
+                "candles": [(112, 114, 100, 102), (103, 108, 101, 107)],
+                "summary": "大黑K後出現小紅K，且小紅K落在前一根實體內，代表賣壓放緩。",
+                "watch": "它是止跌訊號，不是強烈攻擊訊號。",
+                "confirm": "後續突破母線高點，才較像反轉啟動。",
+                "trap": "若只是小反彈後再破低，母子型態會失效。",
+                "steps": ["第一根大黑K顯示賣壓。", "第二根小紅K縮在前一根實體內，賣壓暫緩。"],
+            },
+            {
+                "name": "穿刺線",
+                "bias": "多頭反轉",
+                "candles": [(114, 116, 102, 104), (101, 113, 100, 112)],
+                "summary": "下跌後隔日開低，但收盤拉回前一根黑K實體中線以上。",
+                "watch": "收盤越接近前一根開盤，多方反攻越強。",
+                "confirm": "隔日續紅或站上前高，訊號更完整。",
+                "trap": "若只拉回一點點，沒有越過黑K中線，力道不足。",
+                "steps": ["第一根黑K延續下跌。", "第二根開低後買盤拉升，收在黑K實體中線以上。"],
+            },
+            {
+                "name": "晨星",
+                "bias": "多頭反轉",
+                "candles": [(116, 118, 104, 105), (103, 106, 100, 104), (106, 116, 105, 115)],
+                "summary": "大黑K、小實體、再接大紅K，是典型低檔轉強結構。",
+                "watch": "第三根紅K收越高，反轉意味越強。",
+                "confirm": "第三根最好收回第一根黑K實體中線以上。",
+                "trap": "若第三根紅K量縮且無法突破壓力，容易變成弱反彈。",
+                "steps": ["第一根大黑K代表空方主導。", "第二根小實體代表賣壓猶豫。", "第三根大紅K代表買方重新掌控。"],
+            },
+            {
+                "name": "紅三兵 / 三陽開泰",
+                "bias": "多頭延續",
+                "candles": [(100, 108, 98, 106), (104, 113, 103, 111), (109, 120, 108, 118)],
+                "summary": "連續三根陽線，收盤逐日墊高，代表買盤穩定推進。",
+                "watch": "開盤落在前一根實體內、收盤創高，是較漂亮的型態。",
+                "confirm": "第三根後不要立刻爆大量長上影，否則可能短線過熱。",
+                "trap": "漲太快且離均線太遠時，紅三兵也可能成為追高風險。",
+                "steps": ["第一根紅K扭轉短線氣氛。", "第二根續攻並收高。", "第三根再收高，形成步步高升。"],
+            },
+            {
+                "name": "三明治",
+                "bias": "多頭反轉",
+                "candles": [(112, 114, 102, 104), (105, 112, 103, 111), (113, 114, 102, 104.2)],
+                "summary": "兩根黑K夾一根紅K，且兩根黑K收盤接近，低檔支撐被反覆測試。",
+                "watch": "重點不是中間紅K，而是低點附近賣壓無法再壓低。",
+                "confirm": "後續突破中間紅K高點，多方才更明確。",
+                "trap": "若第三根黑K直接跌破前低，型態失效。",
+                "steps": ["第一根黑K測出支撐。", "第二根紅K反彈。", "第三根再壓回但收在相近支撐，顯示低檔有守。"],
+            },
+            {
+                "name": "梯底",
+                "bias": "多頭反轉",
+                "candles": [(115, 116, 108, 109), (109, 110, 102, 103), (103, 104, 97, 98), (98, 104, 96, 103), (103, 112, 102, 111)],
+                "summary": "連續下跌後，低檔出現止跌與反攻，像從階梯底部轉上。",
+                "watch": "最後一根紅K是否重新站回短線壓力，是重點。",
+                "confirm": "突破前面黑K高點或站回均線，較有反轉可信度。",
+                "trap": "弱勢趨勢中容易只是一日反彈，仍要等確認。",
+                "steps": ["價格連續走低。", "跌勢放慢。", "低檔買盤試圖守住。", "紅K反攻。", "突破短線壓力，型態完成。"],
+            },
+        ],
+        "空頭型態": [
+            {
+                "name": "吊人",
+                "bias": "空頭反轉",
+                "candles": [(100, 108, 98, 107), (108, 116, 107, 115), (116, 118, 103, 114)],
+                "summary": "上漲後出現長下影小實體，代表高檔曾被大幅賣壓打低。",
+                "watch": "位置在高檔才有空頭反轉意義。",
+                "confirm": "隔日跌破吊人低點或收黑，訊號較完整。",
+                "trap": "若隔日續創新高，吊人訊號失效。",
+                "steps": ["先有上漲背景。", "高檔盤中被賣壓打低。", "雖拉回收盤，但留下警訊。"],
+            },
+            {
+                "name": "射擊之星 / 流星",
+                "bias": "空頭反轉",
+                "candles": [(100, 108, 98, 107), (108, 116, 106, 115), (116, 128, 114, 117)],
+                "summary": "上漲後出現長上影小實體，代表追價買盤被賣壓打回。",
+                "watch": "上影線越長，表示上方賣壓越重。",
+                "confirm": "下一根跌破流星低點，空方訊號較強。",
+                "trap": "若隔日直接突破上影高點，表示賣壓被消化。",
+                "steps": ["先有上漲背景。", "盤中衝高。", "收盤被壓回，留下長上影。"],
+            },
+            {
+                "name": "空頭吞噬",
+                "bias": "空頭反轉",
+                "candles": [(104, 114, 103, 112), (113, 115, 101, 102)],
+                "summary": "前一根紅K後，後一根黑K實體吞噬前一根實體，代表賣方反攻。",
+                "watch": "吞噬越完整，空方力道越明確。",
+                "confirm": "隔日無法站回黑K中段以上，偏弱。",
+                "trap": "若發生在低檔，可能只是震盪洗盤，不一定續跌。",
+                "steps": ["第一根紅K延續強勢。", "第二根開高走低，黑K實體吃掉前一根紅K。"],
+            },
+            {
+                "name": "空頭母子",
+                "bias": "空頭反轉",
+                "candles": [(100, 114, 99, 112), (111, 113, 106, 107)],
+                "summary": "大紅K後出現小黑K，且小黑K落在前一根實體內，代表買盤轉弱。",
+                "watch": "它偏向警訊，通常需要後續跌破確認。",
+                "confirm": "跌破母線低點，空方訊號較完整。",
+                "trap": "強勢多頭中常見休息小黑K，不一定反轉。",
+                "steps": ["第一根大紅K推升。", "第二根小黑K縮在前一根實體內，買盤猶豫。"],
+            },
+            {
+                "name": "烏雲罩頂",
+                "bias": "空頭反轉",
+                "candles": [(100, 114, 99, 113), (116, 117, 104, 106)],
+                "summary": "上漲後隔日開高，但收盤跌回前一根紅K實體中線以下。",
+                "watch": "收盤越低，空方反撲越強。",
+                "confirm": "隔日續跌或跌破前低，訊號更完整。",
+                "trap": "若只跌回一點點，沒有跌破紅K中線，力道不足。",
+                "steps": ["第一根紅K延續強勢。", "第二根開高後賣壓湧出，收在紅K中線以下。"],
+            },
+            {
+                "name": "夜星",
+                "bias": "空頭反轉",
+                "candles": [(100, 113, 99, 112), (114, 117, 112, 115), (113, 114, 102, 103)],
+                "summary": "大紅K、小實體、再接大黑K，是典型高檔轉弱結構。",
+                "watch": "第三根黑K收越低，反轉意味越強。",
+                "confirm": "第三根最好跌破第一根紅K實體中線。",
+                "trap": "若第三根沒有量或沒有跌破關鍵支撐，可能只是拉回。",
+                "steps": ["第一根大紅K代表多方主導。", "第二根小實體代表追價猶豫。", "第三根大黑K代表賣方重新掌控。"],
+            },
+            {
+                "name": "黑三鴉 / 三隻烏鴉",
+                "bias": "空頭延續",
+                "candles": [(118, 120, 110, 112), (113, 114, 105, 106), (107, 108, 98, 100)],
+                "summary": "連續三根陰線，收盤逐日走低，代表賣壓穩定釋放。",
+                "watch": "開盤落在前一根實體內、收盤接近低點，是較典型的型態。",
+                "confirm": "若跌破支撐或均線轉弱，空方訊號更強。",
+                "trap": "短線急跌後才出現黑三鴉，可能已有過度恐慌，追空要小心。",
+                "steps": ["第一根黑K轉弱。", "第二根續跌並收低。", "第三根再收低，形成步步下壓。"],
+            },
+            {
+                "name": "頸上線",
+                "bias": "空頭延續",
+                "candles": [(116, 117, 104, 105), (103, 108, 101, 105.5)],
+                "summary": "下跌後隔日開低反彈，但只收回前一根低點附近，反彈力道不足。",
+                "watch": "反彈無法站回黑K實體內部，代表買盤弱。",
+                "confirm": "後續跌破第二根低點，續跌機率提高。",
+                "trap": "若隔日強攻站回黑K中線，空方延續訊號失效。",
+                "steps": ["第一根大黑K下跌。", "第二根開低反彈，但只回到前低附近。"],
+            },
+        ],
+    }
+
+
+def teaching_candles_dataframe(pattern: dict, visible_count: int) -> pd.DataFrame:
+    candles = pattern["candles"][:visible_count]
+    return pd.DataFrame(
+        [
+            {"Date": f"第 {idx} 根", "Open": o, "High": h, "Low": l, "Close": c}
+            for idx, (o, h, l, c) in enumerate(candles, start=1)
+        ]
+    )
+
+
+def draw_teaching_candles(pattern: dict, visible_count: int) -> go.Figure:
+    data = teaching_candles_dataframe(pattern, visible_count)
+    fig = go.Figure()
+    fig.add_trace(
+        go.Candlestick(
+            x=data["Date"],
+            open=data["Open"],
+            high=data["High"],
+            low=data["Low"],
+            close=data["Close"],
+            increasing_line_color="#e53935",
+            increasing_fillcolor="#ff4d4f",
+            decreasing_line_color="#128c4a",
+            decreasing_fillcolor="#18c66a",
+            name=pattern["name"],
+        )
+    )
+    if not data.empty:
+        last = data.iloc[-1]
+        color = "#e53935" if "多頭" in pattern["bias"] or pattern["bias"] == "多方" else "#128c4a"
+        fig.add_annotation(
+            x=last["Date"],
+            y=last["High"] + 4,
+            text=pattern["name"],
+            showarrow=False,
+            font={"size": 18, "color": color},
+            bgcolor="rgba(255,255,255,0.86)",
+            bordercolor=color,
+            borderwidth=1,
+        )
+    fig.update_layout(
+        height=430,
+        margin={"l": 20, "r": 20, "t": 42, "b": 20},
+        xaxis_rangeslider_visible=False,
+        plot_bgcolor="#fffaf2",
+        paper_bgcolor="#fffaf2",
+        yaxis_title="示意價格",
+        title=f"{pattern['name']}：逐步形成示意",
+    )
+    return fig
+
+
+def render_candlestick_teaching() -> None:
+    st.title("K線型態教學")
+    st.caption("用示意 K 線理解型態背後的多空心理。反轉型態不是保證反轉，通常仍要搭配位置、成交量、均線與隔日確認。")
+
+    st.markdown(
+        """
+        <style>
+        .teaching-card {
+            border: 1px solid #ead9c2;
+            background: linear-gradient(135deg, #fffaf2 0%, #fff4e4 100%);
+            border-radius: 16px;
+            padding: 16px 18px;
+            margin-bottom: 12px;
+        }
+        .bull-badge {
+            color: #b71c1c;
+            background: #ffe5e5;
+            border-radius: 999px;
+            padding: 4px 10px;
+            font-weight: 700;
+        }
+        .bear-badge {
+            color: #0b6b37;
+            background: #ddf7e7;
+            border-radius: 999px;
+            padding: 4px 10px;
+            font-weight: 700;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    library = candle_pattern_library()
+    category = st.radio("型態分類", list(library.keys()), horizontal=True)
+    patterns = library[category]
+    selected_name = st.selectbox("選擇型態", [item["name"] for item in patterns])
+    pattern = next(item for item in patterns if item["name"] == selected_name)
+
+    max_step = len(pattern["candles"])
+    use_steps = st.toggle("逐步動畫模式", value=True, help="用 slider 一根一根看型態如何形成。")
+    step = st.slider("形成步驟", 1, max_step, max_step) if use_steps and max_step > 1 else max_step
+
+    chart_col, text_col = st.columns([0.58, 0.42])
+    with chart_col:
+        st.plotly_chart(draw_teaching_candles(pattern, step), use_container_width=True)
+    with text_col:
+        badge_class = "bull-badge" if "多" in pattern["bias"] or pattern["bias"] == "多方" else "bear-badge"
+        if pattern["bias"] == "中性":
+            badge_class = "bull-badge"
+        st.markdown(
+            f"<div class='teaching-card'><span class='{badge_class}'>{pattern['bias']}</span>"
+            f"<h3>{pattern['name']}</h3><p>{pattern['summary']}</p></div>",
+            unsafe_allow_html=True,
+        )
+        st.markdown("#### 目前步驟")
+        steps = pattern.get("steps", [])
+        current_step_text = steps[min(step - 1, len(steps) - 1)] if steps else pattern["summary"]
+        st.write(current_step_text)
+        st.markdown("#### 判讀重點")
+        st.write(pattern["watch"])
+        st.markdown("#### 確認方式")
+        st.write(pattern["confirm"])
+        st.markdown("#### 常見陷阱")
+        st.write(pattern["trap"])
+
+    st.divider()
+    st.subheader("快速索引")
+    cols = st.columns(3)
+    for idx, (group_name, group_patterns) in enumerate(library.items()):
+        with cols[idx]:
+            st.markdown(f"#### {group_name}")
+            for item in group_patterns:
+                st.write(f"- {item['name']}：{item['bias']}")
+
+    st.info(
+        "教學圖是型態示意，不是即時訊號。實戰上請先看趨勢位置，再看型態，最後用成交量、支撐壓力與隔日K線確認。"
+    )
+
+
 def render_home() -> None:
     st.title("投資工具首頁")
-    st.caption("這支程式同時包含 K 線型態分析、權證計算機、權證推薦與主動 ETF 持股追蹤，之後可直接部署到 GitHub 與 Streamlit Community Cloud。")
-    left, middle_left, middle_right, right = st.columns(4)
-    with left:
+    st.caption("這支程式同時包含 K 線型態分析、K 線型態教學、權證計算機、權證推薦與主動 ETF 持股追蹤，之後可直接部署到 GitHub 與 Streamlit Community Cloud。")
+    kline_left, kline_right = st.columns(2)
+    with kline_left:
         st.markdown("### K線型態分析")
         st.write("查看台股 K 線、技術指標、型態訊號與 AI 分析。")
         if st.button("前往 K線型態分析", type="primary", use_container_width=True):
             go_to("stock2")
-    with middle_left:
+    with kline_right:
+        st.markdown("### K線型態教學")
+        st.write("用 Plotly 示意圖與逐步動畫理解多頭、空頭型態。")
+        if st.button("前往 K線型態教學", type="primary", use_container_width=True):
+            go_to("candlestick_teaching")
+
+    st.divider()
+    warrant_left, warrant_right = st.columns(2)
+    with warrant_left:
         st.markdown("### 權證計算機")
         st.write("使用凱基 backend service 查詢權證資料與試算參考價格。")
         if st.button("前往 權證計算機", type="primary", use_container_width=True):
             go_to("warrant")
-    with middle_right:
+    with warrant_right:
         st.markdown("### 權證推薦")
         st.write("依標的篩選認購權證，優先找長天期、較高行使比例與較佳交易條件。")
         if st.button("前往 權證推薦", type="primary", use_container_width=True):
             go_to("recommend")
-    with right:
+
+    st.divider()
+    etf_left, etf_right = st.columns([0.5, 0.5])
+    with etf_left:
         st.markdown("### 主動ETF追蹤")
         st.write("新增台灣主動型 ETF，盤後追蹤每日持股進出與股數變化。")
         if st.button("前往 主動ETF追蹤", type="primary", use_container_width=True):
             go_to("active_etf")
+    with etf_right:
+        st.write("")
 
 
 def render_warrant_calculator() -> None:
@@ -2360,21 +2856,29 @@ def render_stock2_tool():
             "K線型態",
             options=list(PATTERN_CHOICES),
             default=[PATTERN_SELECT_ALL],
-            help="選擇全選會顯示所有 K 線型態標記。",
+            help="選擇全選會顯示多空組合型態；紅K、黑K、十字線需手動勾選，避免圖上標籤過多。",
         )
+        red_candle_on = "Red Candle (紅K/陽線)" in selected_patterns
+        black_candle_on = "Black Candle (黑K/陰線)" in selected_patterns
+        doji_on = "Doji (十字線)" in selected_patterns
         ms_on = is_pattern_selected(selected_patterns, "Morning Star (晨星)")
         es_on = is_pattern_selected(selected_patterns, "Evening Star (暮星)")
         ss_on = is_pattern_selected(selected_patterns, "Shooting Star (射擊之星)")
         tws_on = is_pattern_selected(selected_patterns, "Three White Soldiers (紅三兵)")
         tbc_on = is_pattern_selected(selected_patterns, "Three Black Crows (黑三鴉)")
         be_on = is_pattern_selected(selected_patterns, "Bullish Engulfing (多頭吞噬)")
+        piercing_on = is_pattern_selected(selected_patterns, "Piercing Line (穿刺線)")
         hammer_on = is_pattern_selected(selected_patterns, "Hammer (槌子)")
         hanging_on = is_pattern_selected(selected_patterns, "Hanging Man (吊人線)")
         meteor_on = is_pattern_selected(selected_patterns, "Meteor (流星)")
         bullish_harami_on = is_pattern_selected(selected_patterns, "Bullish Harami (多頭母子)")
         bullish_harami_cross_on = is_pattern_selected(selected_patterns, "Bullish Harami Cross (多頭母子十字)")
+        sandwich_on = is_pattern_selected(selected_patterns, "Sandwich (三明治)")
+        ladder_bottom_on = is_pattern_selected(selected_patterns, "Ladder Bottom (梯底)")
         bearish_harami_on = is_pattern_selected(selected_patterns, "Bearish Harami (空頭母子)")
         bearish_engulfing_on = is_pattern_selected(selected_patterns, "Bearish Engulfing (陰吞噬)")
+        dark_cloud_cover_on = is_pattern_selected(selected_patterns, "Dark Cloud Cover (烏雲罩頂)")
+        on_neck_line_on = is_pattern_selected(selected_patterns, "On Neck Line (頸上線)")
 
         st.subheader("AI 分析")
         ai_provider = st.radio(
@@ -2395,19 +2899,27 @@ def render_stock2_tool():
                 kd_on,
                 rsi_on,
                 macd_on,
+                red_candle_on,
+                black_candle_on,
+                doji_on,
                 ms_on,
                 es_on,
                 ss_on,
                 tws_on,
                 tbc_on,
                 be_on,
+                piercing_on,
                 hammer_on,
                 hanging_on,
                 meteor_on,
                 bullish_harami_on,
                 bullish_harami_cross_on,
+                sandwich_on,
+                ladder_bottom_on,
                 bearish_harami_on,
                 bearish_engulfing_on,
+                dark_cloud_cover_on,
+                on_neck_line_on,
             )
             data = get_stock_data(opts)
             st.session_state["stock_data"] = data
@@ -2474,6 +2986,8 @@ def main():
 
     if current == "stock2":
         render_stock2_tool()
+    elif current == "candlestick_teaching":
+        render_candlestick_teaching()
     elif current == "warrant":
         render_warrant_calculator()
     elif current == "recommend":
