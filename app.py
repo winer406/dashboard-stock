@@ -83,7 +83,17 @@ COMMON_STOCK_FALLBACKS = {
     "台積電": "2330.TW",
     "緯創": "3231.TW",
     "欣興": "3037.TW",
+    "廣明": "6188.TWO",
+    "九豪": "6127.TWO",
+    "威剛": "3260.TWO",
+    "星宇": "2646.TW",
+    "星宇航空": "2646.TW",
+    "力成": "6239.TW",
     "越峰": "8121.TWO",
+}
+UNSUPPORTED_STOCK_NAMES = {
+    "世紀樺欣": "7752 世紀樺欣目前不是一般上市/上櫃 Yahoo Finance 代號，K線型態分析暫不支援。",
+    "7752": "7752 世紀樺欣目前不是一般上市/上櫃 Yahoo Finance 代號，K線型態分析暫不支援。",
 }
 PATTERN_SELECT_ALL = "全選"
 PATTERN_CHOICES = (
@@ -600,6 +610,10 @@ def normalize_ticker(stock_id: str) -> str:
         raise ValueError("請輸入股票代碼或名稱")
     if ticker.endswith(".TW") or ticker.endswith(".TWO"):
         return ticker
+
+    unsupported_message = UNSUPPORTED_STOCK_NAMES.get(normalize_stock_lookup_text(raw))
+    if unsupported_message:
+        raise ValueError(unsupported_message)
 
     resolved = resolve_tw_stock(raw)
     if resolved:
