@@ -79,6 +79,12 @@ ACTIVE_ETF_SNAPSHOT_COLUMNS = [
     "shares",
     "contribution_percent",
 ]
+COMMON_STOCK_FALLBACKS = {
+    "台積電": "2330.TW",
+    "緯創": "3231.TW",
+    "欣興": "3037.TW",
+    "越峰": "8121.TWO",
+}
 PATTERN_SELECT_ALL = "全選"
 PATTERN_CHOICES = (
     PATTERN_SELECT_ALL,
@@ -104,6 +110,29 @@ PATTERN_CHOICES = (
     "Dark Cloud Cover (烏雲罩頂)",
     "On Neck Line (頸上線)",
 )
+PATTERN_DEFINITIONS = [
+    {"column": "Red Candle", "label": "紅K", "side": "neutral", "choice": "Red Candle (紅K/陽線)", "manual_only": True},
+    {"column": "Black Candle", "label": "黑K", "side": "neutral", "choice": "Black Candle (黑K/陰線)", "manual_only": True},
+    {"column": "Doji", "label": "十字線", "side": "neutral", "choice": "Doji (十字線)", "manual_only": True},
+    {"column": "Morning Star", "label": "晨星", "side": "bullish", "choice": "Morning Star (晨星)"},
+    {"column": "Three White Soldiers", "label": "紅三兵", "side": "bullish", "choice": "Three White Soldiers (紅三兵)"},
+    {"column": "Bullish Engulfing", "label": "多頭吞噬", "side": "bullish", "choice": "Bullish Engulfing (多頭吞噬)"},
+    {"column": "Piercing Line", "label": "穿刺線", "side": "bullish", "choice": "Piercing Line (穿刺線)"},
+    {"column": "Hammer", "label": "槌子", "side": "bullish", "choice": "Hammer (槌子)"},
+    {"column": "Bullish Harami", "label": "多頭母子", "side": "bullish", "choice": "Bullish Harami (多頭母子)"},
+    {"column": "Bullish Harami Cross", "label": "多頭母子十字", "side": "bullish", "choice": "Bullish Harami Cross (多頭母子十字)"},
+    {"column": "Sandwich", "label": "三明治", "side": "bullish", "choice": "Sandwich (三明治)"},
+    {"column": "Ladder Bottom", "label": "梯底", "side": "bullish", "choice": "Ladder Bottom (梯底)"},
+    {"column": "Evening Star", "label": "暮星", "side": "bearish", "choice": "Evening Star (暮星)"},
+    {"column": "Shooting Star", "label": "射擊之星", "side": "bearish", "choice": "Shooting Star (射擊之星)"},
+    {"column": "Three Black Crows", "label": "黑三鴉", "side": "bearish", "choice": "Three Black Crows (黑三鴉)"},
+    {"column": "Hanging Man", "label": "吊人線", "side": "bearish", "choice": "Hanging Man (吊人線)"},
+    {"column": "Meteor", "label": "流星", "side": "bearish", "choice": "Meteor (流星)"},
+    {"column": "Bearish Harami", "label": "空頭母子", "side": "bearish", "choice": "Bearish Harami (空頭母子)"},
+    {"column": "Bearish Engulfing", "label": "陰吞噬", "side": "bearish", "choice": "Bearish Engulfing (陰吞噬)"},
+    {"column": "Dark Cloud Cover", "label": "烏雲罩頂", "side": "bearish", "choice": "Dark Cloud Cover (烏雲罩頂)"},
+    {"column": "On Neck Line", "label": "頸上線", "side": "bearish", "choice": "On Neck Line (頸上線)"},
+]
 
 @dataclass
 class ChartOptions:
@@ -545,6 +574,25 @@ def resolve_tw_stock(value: str) -> dict | None:
     return None
 
 
+def resolve_stock_with_kgi(value: str) -> dict | None:
+    try:
+        matches = resolve_underlying_matches(value)
+    except Exception:
+        return None
+    if not matches:
+        return None
+
+    text = str(matches[0].get("INSTR_STKID_NAME", "")).strip()
+    match = re.match(r"^([0-9A-Z]{4,6})\s+(.+)$", text)
+    if not match:
+        return None
+
+    code, name = match.group(1), match.group(2)
+    listed_match = resolve_tw_stock(code)
+    ticker = listed_match["ticker"] if listed_match else f"{code}.TW"
+    return {"code": code, "name": name, "ticker": ticker}
+
+
 def normalize_ticker(stock_id: str) -> str:
     raw = str(stock_id or "").strip()
     ticker = raw.upper()
@@ -557,12 +605,72 @@ def normalize_ticker(stock_id: str) -> str:
     if resolved:
         return resolved["ticker"]
 
+    fallback = COMMON_STOCK_FALLBACKS.get(normalize_stock_lookup_text(raw))
+    if fallback:
+        return fallback
+
+    kgi_resolved = resolve_stock_with_kgi(raw)
+    if kgi_resolved:
+        return kgi_resolved["ticker"]
+
     if re.fullmatch(r"[0-9A-Z]{4,6}", ticker):
         return f"{ticker}.TW"
     raise ValueError(f"查無股票代碼或名稱：{raw}")
 
 def is_pattern_selected(selected_patterns: list[str], pattern_name: str) -> bool:
     return PATTERN_SELECT_ALL in selected_patterns or pattern_name in selected_patterns
+
+
+def selected_pattern_definitions(options: ChartOptions) -> list[dict]:
+    selected = []
+    for definition in PATTERN_DEFINITIONS:
+        option_name = f"show_{definition['column'].lower().replace(' ', '_')}"
+        if getattr(options, option_name, False):
+            selected.append(definition)
+    return selected
+
+
+def build_pattern_summary_columns(data: pd.DataFrame, options: ChartOptions) -> pd.DataFrame:
+    definitions = selected_pattern_definitions(options)
+    summaries = []
+    sides = []
+    for _, row in data.iterrows():
+        labels = [item["label"] for item in definitions if bool(row.get(item["column"], False))]
+        side_set = {item["side"] for item in definitions if bool(row.get(item["column"], False))}
+        summaries.append("、".join(labels) if labels else "無")
+        if "bullish" in side_set:
+            sides.append("bullish")
+        elif "bearish" in side_set:
+            sides.append("bearish")
+        elif "neutral" in side_set:
+            sides.append("neutral")
+        else:
+            sides.append("")
+    result = data.copy()
+    result["Pattern Summary"] = summaries
+    result["Pattern Side"] = sides
+    return result
+
+
+def recent_pattern_signals(data: pd.DataFrame, options: ChartOptions, limit: int = 30) -> pd.DataFrame:
+    definitions = selected_pattern_definitions(options)
+    records = []
+    side_labels = {"bullish": "偏多", "bearish": "偏空", "neutral": "中性"}
+    for date_value, row in data.iterrows():
+        for item in definitions:
+            if bool(row.get(item["column"], False)):
+                records.append(
+                    {
+                        "日期": date_value.strftime("%Y-%m-%d") if hasattr(date_value, "strftime") else str(date_value),
+                        "型態": item["label"],
+                        "方向": side_labels.get(item["side"], ""),
+                        "收盤": round(float(row["Close"]), 2),
+                    }
+                )
+    if not records:
+        return pd.DataFrame(columns=["日期", "型態", "方向", "收盤"])
+    return pd.DataFrame(records).tail(limit).sort_values("日期", ascending=False).reset_index(drop=True)
+
 
 def get_stock_code_and_market(ticker: str) -> tuple[str, str]:
     normalized = normalize_ticker(ticker)
@@ -869,6 +977,7 @@ def draw_institutional_trade_chart(data: pd.DataFrame):
     return fig
 
 def draw_chart(data: pd.DataFrame, options: ChartOptions):
+    data = build_pattern_summary_columns(data, options)
     extra_panels = []
     if options.show_kd:
         extra_panels.append("kd")
@@ -887,10 +996,50 @@ def draw_chart(data: pd.DataFrame, options: ChartOptions):
         row_heights=row_heights,
     )
 
+    hover_data = pd.DataFrame(
+        {
+            "Volume": data["Volume"].fillna(0).round(0),
+            "MA5": data["MA5"].round(2),
+            "MA20": data["MA20"].round(2),
+            "MA60": data["MA60"].round(2),
+            "MA120": data["MA120"].round(2),
+            "Upper Band": data["Upper Band"].round(2),
+            "Lower Band": data["Lower Band"].round(2),
+            "K": data["K"].round(2),
+            "D": data["D"].round(2),
+            "RSI": data["RSI"].round(2),
+            "MACD": data["MACD"].round(2),
+            "MACD Signal": data["MACD Signal"].round(2),
+            "Pattern Summary": data["Pattern Summary"],
+        },
+        index=data.index,
+    )
+
     # K線
     fig.add_trace(go.Candlestick(
         x=data.index, open=data["Open"], high=data["High"], low=data["Low"], close=data["Close"],
-        increasing_line_color="red", decreasing_line_color="green", name="K線"
+        increasing_line_color="red",
+        decreasing_line_color="green",
+        name="K線",
+        customdata=hover_data,
+        hovertemplate=(
+            "日期：%{x|%Y-%m-%d}<br>"
+            "開：%{open:.2f}<br>"
+            "高：%{high:.2f}<br>"
+            "低：%{low:.2f}<br>"
+            "收：%{close:.2f}<br>"
+            "成交量：%{customdata[0]:,.0f}<br>"
+            "MA5：%{customdata[1]}<br>"
+            "MA20：%{customdata[2]}<br>"
+            "MA60：%{customdata[3]}<br>"
+            "MA120：%{customdata[4]}<br>"
+            "布林上軌：%{customdata[5]}<br>"
+            "布林下軌：%{customdata[6]}<br>"
+            "K/D：%{customdata[7]} / %{customdata[8]}<br>"
+            "RSI：%{customdata[9]}<br>"
+            "MACD / Signal：%{customdata[10]} / %{customdata[11]}<br>"
+            "K線型態：%{customdata[12]}<extra></extra>"
+        ),
     ), row=1, col=1)
 
     # 均線與布林
@@ -911,48 +1060,6 @@ def draw_chart(data: pd.DataFrame, options: ChartOptions):
     if options.show_bollinger:
         fig.add_trace(go.Scatter(x=data.index, y=data["Upper Band"], name="布林上軌", line=dict(color="orange", dash="dash")), row=1, col=1)
         fig.add_trace(go.Scatter(x=data.index, y=data["Lower Band"], name="布林下軌", line=dict(color="orange", dash="dash")), row=1, col=1)
-
-    label_pattern_configs = [
-        (options.show_red_candle, "Red Candle", "紅K", "Low", 0.995, "#ef4444", "white", "top", "basic"),
-        (options.show_black_candle, "Black Candle", "黑K", "High", 1.005, "#16a34a", "white", "bottom", "basic"),
-        (options.show_doji, "Doji", "十字線", "High", 1.006, "#64748b", "white", "bottom", "basic"),
-        (options.show_morning_star, "Morning Star", "晨星", "Low", 0.992, "#d62828", "white", "top", "bullish"),
-        (options.show_three_white_soldiers, "Three White Soldiers", "紅三兵", "Low", 0.987, "#d62828", "white", "top", "bullish"),
-        (options.show_bullish_engulfing, "Bullish Engulfing", "多頭吞噬", "Low", 0.982, "#d62828", "white", "top", "bullish"),
-        (options.show_piercing_line, "Piercing Line", "穿刺線", "Low", 0.977, "#d62828", "white", "top", "bullish"),
-        (options.show_hammer, "Hammer", "槌子", "Low", 0.972, "#d62828", "white", "top", "bullish"),
-        (options.show_bullish_harami, "Bullish Harami", "多頭母子", "Low", 0.967, "#d62828", "white", "top", "bullish"),
-        (options.show_bullish_harami_cross, "Bullish Harami Cross", "多頭母子十字", "Low", 0.962, "#d62828", "white", "top", "bullish"),
-        (options.show_sandwich, "Sandwich", "三明治", "Low", 0.957, "#d62828", "white", "top", "bullish"),
-        (options.show_ladder_bottom, "Ladder Bottom", "梯底", "Low", 0.952, "#d62828", "white", "top", "bullish"),
-        (options.show_evening_star, "Evening Star", "暮星", "High", 1.008, "#2f9e44", "white", "bottom", "bearish"),
-        (options.show_shooting_star, "Shooting Star", "射擊之星", "High", 1.013, "#2f9e44", "white", "bottom", "bearish"),
-        (options.show_three_black_crows, "Three Black Crows", "黑三鴉", "High", 1.018, "#2f9e44", "white", "bottom", "bearish"),
-        (options.show_hanging_man, "Hanging Man", "吊人線", "High", 1.023, "#2f9e44", "white", "bottom", "bearish"),
-        (options.show_meteor, "Meteor", "流星", "High", 1.028, "#2f9e44", "white", "bottom", "bearish"),
-        (options.show_bearish_harami, "Bearish Harami", "空頭母子", "High", 1.033, "#2f9e44", "white", "bottom", "bearish"),
-        (options.show_bearish_engulfing, "Bearish Engulfing", "陰吞噬", "High", 1.038, "#2f9e44", "white", "bottom", "bearish"),
-        (options.show_dark_cloud_cover, "Dark Cloud Cover", "烏雲罩頂", "High", 1.043, "#2f9e44", "white", "bottom", "bearish"),
-        (options.show_on_neck_line, "On Neck Line", "頸上線", "High", 1.048, "#2f9e44", "white", "bottom", "bearish"),
-    ]
-    for show, col, label, pos, offset, bg_color, font_color, yanchor, _pattern_side in label_pattern_configs:
-        if show:
-            sigs = data[data[col]]
-            for x_value, row in sigs.iterrows():
-                fig.add_annotation(
-                    x=x_value,
-                    y=row[pos] * offset,
-                    text=label,
-                    showarrow=False,
-                    bgcolor=bg_color,
-                    bordercolor=bg_color,
-                    borderpad=3,
-                    opacity=0.95,
-                    font=dict(color=font_color, size=11),
-                    yanchor=yanchor,
-                    xref="x",
-                    yref="y",
-                )
 
     # 成交量
     fig.add_trace(go.Bar(x=data.index, y=data["Volume"], marker_color=data["VolColor"], name="成交量"), row=2, col=1)
@@ -3003,6 +3110,10 @@ def render_stock2_tool():
             st.session_state.pop("ai_analysis_provider", None)
 
         except Exception as e:
+            st.session_state.pop("stock_data", None)
+            st.session_state.pop("chart_options", None)
+            st.session_state.pop("ai_analysis", None)
+            st.session_state.pop("ai_analysis_provider", None)
             st.error(f"錯誤：{e}")
 
     if "stock_data" in st.session_state and "chart_options" in st.session_state:
@@ -3018,6 +3129,13 @@ def render_stock2_tool():
         c4.metric("成交量", f"{int(l['Volume']):,}")
 
         st.plotly_chart(draw_chart(data, opts), use_container_width=True)
+
+        st.subheader("最近 K線型態訊號")
+        signal_df = recent_pattern_signals(data, opts)
+        if signal_df.empty:
+            st.info("目前查詢區間內沒有偵測到已勾選的 K 線型態。")
+        else:
+            st.dataframe(signal_df, use_container_width=True, hide_index=True)
 
         st.subheader("近 10 個交易日三大法人買賣超")
         st.caption("單位：股；正數為買超，負數為賣超。資料來源：TWSE / TPEx 公開資料。")
