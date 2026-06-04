@@ -481,10 +481,85 @@ def detect_on_neck_line(data: pd.DataFrame) -> pd.Series:
 # -----------------------------
 # 資料處理
 # -----------------------------
+def normalize_stock_lookup_text(value: object) -> str:
+    return re.sub(r"\s+", "", str(value or "").strip().upper())
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_tw_stock_directory() -> list[dict]:
+    rows = []
+    sources = [
+        ("TWSE", ".TW", "https://isin.twse.com.tw/isin/C_public.jsp?strMode=2"),
+        ("TPEX", ".TWO", "https://isin.twse.com.tw/isin/C_public.jsp?strMode=4"),
+    ]
+    for market, suffix, url in sources:
+        try:
+            page = fetch_text(url)
+        except Exception:
+            continue
+
+        table_rows = re.findall(r"<tr[^>]*>(.*?)</tr>", page, flags=re.S | re.I)
+        for row_html in table_rows:
+            cells = re.findall(r"<td[^>]*>(.*?)</td>", row_html, flags=re.S | re.I)
+            if not cells:
+                continue
+            first_cell = strip_html(cells[0]).replace("\u3000", " ")
+            match = re.match(r"^([0-9A-Z]{4,6})\s+(.+)$", first_cell)
+            if not match:
+                continue
+            code, name = match.group(1).strip(), match.group(2).strip()
+            if not code or not name or "有價證券" in name:
+                continue
+            rows.append(
+                {
+                    "code": code,
+                    "name": name,
+                    "market": market,
+                    "suffix": suffix,
+                    "ticker": f"{code}{suffix}",
+                    "code_key": normalize_stock_lookup_text(code),
+                    "name_key": normalize_stock_lookup_text(name),
+                }
+            )
+    return rows
+
+
+def resolve_tw_stock(value: str) -> dict | None:
+    query = normalize_stock_lookup_text(value)
+    if not query:
+        return None
+
+    directory = get_tw_stock_directory()
+    for item in directory:
+        if query == item["code_key"]:
+            return item
+    for item in directory:
+        if query == item["name_key"]:
+            return item
+    for item in directory:
+        if item["name_key"].startswith(query):
+            return item
+    for item in directory:
+        if query in item["name_key"]:
+            return item
+    return None
+
+
 def normalize_ticker(stock_id: str) -> str:
-    ticker = stock_id.strip().upper()
-    if not ticker: raise ValueError("請輸入代碼")
-    return f"{ticker}.TW" if "." not in ticker else ticker
+    raw = str(stock_id or "").strip()
+    ticker = raw.upper()
+    if not ticker:
+        raise ValueError("請輸入股票代碼或名稱")
+    if ticker.endswith(".TW") or ticker.endswith(".TWO"):
+        return ticker
+
+    resolved = resolve_tw_stock(raw)
+    if resolved:
+        return resolved["ticker"]
+
+    if re.fullmatch(r"[0-9A-Z]{4,6}", ticker):
+        return f"{ticker}.TW"
+    raise ValueError(f"查無股票代碼或名稱：{raw}")
 
 def is_pattern_selected(selected_patterns: list[str], pattern_name: str) -> bool:
     return PATTERN_SELECT_ALL in selected_patterns or pattern_name in selected_patterns
@@ -2832,11 +2907,11 @@ def render_stock2_tool():
     with st.sidebar:
         st.header("設定")
         sid = st.text_input(
-            "股票代碼",
-            "2330.TW",
-            help="上市請輸入 xxxx.TW，例如 2330.TW；上櫃請輸入 xxxx.TWO，例如 6208.TWO。",
+            "股票代碼或名稱",
+            "2330",
+            help="可輸入代碼或名稱，例如 2330、8121、台積電、越峰。系統會自動判斷上市 .TW 或上櫃 .TWO。",
         )
-        st.caption("上市請輸入 xxxx.TW；上櫃請輸入 xxxx.TWO。")
+        st.caption("可直接輸入上市/上櫃代碼或股票名稱，不需要加 .TW / .TWO。")
         days = st.slider("查詢天數", 30, 365, 120)
         
         st.subheader("指標顯示")
