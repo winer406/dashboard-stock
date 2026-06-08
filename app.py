@@ -88,6 +88,9 @@ COMMON_STOCK_FALLBACKS = {
     "威剛": "3260.TWO",
     "星宇": "2646.TW",
     "星宇航空": "2646.TW",
+    "強茂": "2481.TW",
+    "台半": "5425.TWO",
+    "德微": "3675.TWO",
     "力成": "6239.TW",
     "越峰": "8121.TWO",
 }
@@ -212,8 +215,8 @@ def detect_black_candle(data: pd.DataFrame) -> pd.Series:
 def detect_doji(data: pd.DataFrame) -> pd.Series:
     """十字線：開盤與收盤接近，代表多空拉鋸。"""
     body = (data["Close"] - data["Open"]).abs()
-    total_range = (data["High"] - data["Low"]).replace(0, pd.NA)
-    return (body <= total_range * 0.1).fillna(False)
+    total_range = (data["High"] - data["Low"]).replace(0, float("nan"))
+    return (body <= total_range * 0.1).fillna(False).astype(bool)
 
 
 def detect_morning_star(data: pd.DataFrame) -> pd.Series:
@@ -615,13 +618,13 @@ def normalize_ticker(stock_id: str) -> str:
     if unsupported_message:
         raise ValueError(unsupported_message)
 
-    resolved = resolve_tw_stock(raw)
-    if resolved:
-        return resolved["ticker"]
-
     fallback = COMMON_STOCK_FALLBACKS.get(normalize_stock_lookup_text(raw))
     if fallback:
         return fallback
+
+    resolved = resolve_tw_stock(raw)
+    if resolved:
+        return resolved["ticker"]
 
     kgi_resolved = resolve_stock_with_kgi(raw)
     if kgi_resolved:
@@ -897,9 +900,24 @@ def calculate_rsi(close: pd.Series, window: int = RSI_WINDOW) -> pd.Series:
 def get_stock_data(options: ChartOptions) -> pd.DataFrame:
     end_date = dt.datetime.today()
     start_date = end_date - dt.timedelta(days=options.display_days + 220)
-    
-    data = yf.download(options.ticker, start=start_date, end=end_date + dt.timedelta(days=1), progress=False)
-    if data.empty: raise ValueError(f"查無 {options.ticker}")
+
+    def download_candidate(ticker: str) -> pd.DataFrame:
+        return yf.download(ticker, start=start_date, end=end_date + dt.timedelta(days=1), progress=False)
+
+    data = download_candidate(options.ticker)
+    if data.empty and (options.ticker.endswith(".TW") or options.ticker.endswith(".TWO")):
+        alternate_ticker = (
+            options.ticker.replace(".TW", ".TWO")
+            if options.ticker.endswith(".TW")
+            else options.ticker.replace(".TWO", ".TW")
+        )
+        alternate_data = download_candidate(alternate_ticker)
+        if not alternate_data.empty:
+            options.ticker = alternate_ticker
+            data = alternate_data
+
+    if data.empty:
+        raise ValueError(f"查無 {options.ticker}，已嘗試上市/上櫃代號仍無資料。")
 
     if isinstance(data.columns, pd.MultiIndex):
         data.columns = data.columns.get_level_values(0)
