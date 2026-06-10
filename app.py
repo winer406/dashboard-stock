@@ -854,6 +854,450 @@ def fetch_tpex_institutional_trade(stock_code: str, trade_date: dt.date) -> dict
         }
     return None
 
+
+def iter_weekday_dates(start_date: dt.date, end_date: dt.date):
+    if start_date > end_date:
+        start_date, end_date = end_date, start_date
+    current = start_date
+    while current <= end_date:
+        if current.weekday() < 5:
+            yield current
+        current += dt.timedelta(days=1)
+
+
+def format_lots(value: int) -> str:
+    lots = int(value) // 1000
+    return f"+{lots:,}" if lots > 0 else f"{lots:,}"
+
+
+def format_signed_number(value: int | float) -> str:
+    return f"+{value:,.0f}" if value > 0 else f"{value:,.0f}"
+
+
+def chip_status_from_lots(total_lots: int) -> str:
+    if total_lots >= 5000:
+        return "大幅買超"
+    if total_lots > 0:
+        return "買超"
+    if total_lots <= -5000:
+        return "大幅賣超"
+    if total_lots < 0:
+        return "賣超"
+    return "持平"
+
+
+def market_status_from_yi(total_yi: float) -> str:
+    if total_yi >= 100:
+        return "大幅買超"
+    if total_yi > 0:
+        return "買超"
+    if total_yi <= -100:
+        return "大幅賣超"
+    if total_yi < 0:
+        return "賣超"
+    return "持平"
+
+
+def fetch_twse_market_institutional_trade(trade_date: dt.date) -> dict | None:
+    url = (
+        "https://www.twse.com.tw/fund/BFI82U"
+        f"?response=json&type=day&dayDate={trade_date.strftime('%Y%m%d')}&weekDate=&monthDate="
+    )
+    payload = fetch_json(url)
+    if payload.get("stat") != "OK":
+        return None
+
+    fields = payload.get("fields", [])
+    rows = payload.get("data", [])
+    foreign = 0
+    investment = 0
+    dealer = 0
+    total = 0
+    for values in rows:
+        row = dict(zip(fields, values))
+        name = str(row.get("單位名稱", "")).strip()
+        amount = parse_int(row.get("買賣差額", 0))
+        if name.startswith("外資及陸資"):
+            foreign += amount
+        elif name == "投信":
+            investment += amount
+        elif name.startswith("自營商"):
+            dealer += amount
+        elif name == "合計":
+            total = amount
+
+    if total == 0:
+        total = foreign + investment + dealer
+    total_yi = total / 100000000
+    return {
+        "日期": trade_date.strftime("%Y-%m-%d"),
+        "外資買賣超(億元)": foreign / 100000000,
+        "投信買賣超(億元)": investment / 100000000,
+        "自營商買賣超(億元)": dealer / 100000000,
+        "三大合計(億元)": total_yi,
+        "籌碼狀態": market_status_from_yi(total_yi),
+    }
+
+
+def build_stock_chip_rows(query: str, start_date: dt.date, end_date: dt.date) -> tuple[pd.DataFrame, str]:
+    ticker = normalize_ticker(query)
+    stock_code, market = get_stock_code_and_market(ticker)
+    rows = []
+    for trade_date in iter_weekday_dates(start_date, end_date):
+        try:
+            record = (
+                fetch_tpex_institutional_trade(stock_code, trade_date)
+                if market == "TPEX"
+                else fetch_twse_institutional_trade(stock_code, trade_date)
+            )
+        except Exception:
+            record = None
+        if not record:
+            continue
+        total_lots = int(record["三大法人合計"]) // 1000
+        rows.append(
+            {
+                "日期": record["日期"],
+                "代號": stock_code,
+                "市場": "上櫃" if market == "TPEX" else "上市",
+                "外資買賣超(張)": format_lots(record["外資買賣超"]),
+                "投信買賣超(張)": format_lots(record["投信買賣超"]),
+                "自營商買賣超(張)": format_lots(record["自營商買賣超"]),
+                "三大合計(張)": f"+{total_lots:,}" if total_lots > 0 else f"{total_lots:,}",
+                "籌碼狀態": chip_status_from_lots(total_lots),
+            }
+        )
+    return pd.DataFrame(rows), ticker
+
+
+def build_market_chip_rows(start_date: dt.date, end_date: dt.date) -> pd.DataFrame:
+    rows = []
+    for trade_date in iter_weekday_dates(start_date, end_date):
+        try:
+            record = fetch_twse_market_institutional_trade(trade_date)
+        except Exception:
+            record = None
+        if record:
+            rows.append(record)
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    for column in ["外資買賣超(億元)", "投信買賣超(億元)", "自營商買賣超(億元)", "三大合計(億元)"]:
+        df[column] = df[column].map(lambda value: f"+{value:,.2f}" if value > 0 else f"{value:,.2f}")
+    return df
+
+
+def strip_html_tags(value: str) -> str:
+    text = re.sub(r"<[^>]+>", "", value)
+    return html_lib.unescape(text).replace("\xa0", " ").strip()
+
+
+def parse_broker_rows(section_html: str, side: str) -> list[dict]:
+    rows = []
+    tr_matches = re.findall(r"<tr[^>]*>(.*?)</tr>", section_html, flags=re.IGNORECASE | re.DOTALL)
+    side_offset = 0 if side == "buy" else 5
+    for tr_html in tr_matches:
+        cells = re.findall(r"<td[^>]*>(.*?)</td>", tr_html, flags=re.IGNORECASE | re.DOTALL)
+        if len(cells) < side_offset + 5:
+            continue
+
+        broker = strip_html_tags(cells[side_offset])
+        if not broker or broker in {"買超券商", "賣超券商", "平均買超成本", "平均賣超成本"}:
+            continue
+
+        buy_lots = parse_int(strip_html_tags(cells[side_offset + 1]))
+        sell_lots = parse_int(strip_html_tags(cells[side_offset + 2]))
+        net_lots = parse_int(strip_html_tags(cells[side_offset + 3]))
+        ratio = strip_html_tags(cells[side_offset + 4])
+        if side == "sell":
+            net_lots = -abs(net_lots)
+
+        rows.append(
+            {
+                "券商分點": broker,
+                "買進(張)": buy_lots,
+                "賣出(張)": sell_lots,
+                "買賣超(張)": net_lots,
+                "佔成交比重": ratio,
+            }
+        )
+    return rows
+
+
+def parse_percent(value: object) -> float:
+    text = str(value).replace("%", "").replace(",", "").strip()
+    if not text:
+        return 0.0
+    try:
+        return float(text)
+    except ValueError:
+        return 0.0
+
+
+def parse_moneydj_average_costs(page_html: str) -> tuple[float | None, float | None]:
+    cost_match = re.search(
+        r"平均買超成本.*?<td[^>]*>(.*?)</td>.*?平均賣超成本.*?<td[^>]*>(.*?)</td>",
+        page_html,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if not cost_match:
+        return None, None
+    buy_cost = parse_percent(strip_html_tags(cost_match.group(1)))
+    sell_cost = parse_percent(strip_html_tags(cost_match.group(2)))
+    return buy_cost or None, sell_cost or None
+
+
+def infer_total_volume_lots(*frames: pd.DataFrame) -> float | None:
+    for frame in frames:
+        if frame.empty:
+            continue
+        for row in frame.to_dict("records"):
+            net_lots = abs(parse_int(row.get("買賣超(張)", 0)))
+            ratio = parse_percent(row.get("佔成交比重", 0))
+            if net_lots > 0 and ratio > 0:
+                return net_lots / (ratio / 100)
+    return None
+
+
+def broker_display_dataframe(frame: pd.DataFrame) -> pd.DataFrame:
+    display_df = frame.copy()
+    if display_df.empty:
+        return display_df
+    for column in ["買進(張)", "賣出(張)"]:
+        display_df[column] = display_df[column].map(lambda value: f"{int(value):,}")
+    display_df["買賣超(張)"] = display_df["買賣超(張)"].map(format_signed_number)
+    return display_df
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_moneydj_broker_trade_raw(stock_code: str, start_date: dt.date, end_date: dt.date) -> dict:
+    if start_date > end_date:
+        start_date, end_date = end_date, start_date
+
+    params = {
+        "a": stock_code,
+        "e": f"{start_date.year}-{start_date.month}-{start_date.day}",
+        "f": f"{end_date.year}-{end_date.month}-{end_date.day}",
+    }
+    url = "https://fubon-ebrokerdj.fbs.com.tw/z/zc/zco/zco.djhtm?" + urllib.parse.urlencode(params)
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0",
+            "Referer": "https://fubon-ebrokerdj.fbs.com.tw/",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=20, context=ssl._create_unverified_context()) as response:
+        page_html = response.read().decode("big5", "ignore")
+
+    buy_df = pd.DataFrame(parse_broker_rows(page_html, "buy")).sort_values("買賣超(張)", ascending=False).head(10)
+    sell_df = pd.DataFrame(parse_broker_rows(page_html, "sell")).sort_values("買賣超(張)", ascending=True).head(10)
+    avg_buy_cost, avg_sell_cost = parse_moneydj_average_costs(page_html)
+    return {
+        "buy": buy_df.reset_index(drop=True),
+        "sell": sell_df.reset_index(drop=True),
+        "avg_buy_cost": avg_buy_cost,
+        "avg_sell_cost": avg_sell_cost,
+        "total_volume_lots": infer_total_volume_lots(buy_df, sell_df),
+    }
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_moneydj_broker_trades(stock_code: str, start_date: dt.date, end_date: dt.date) -> tuple[pd.DataFrame, pd.DataFrame]:
+    raw = fetch_moneydj_broker_trade_raw(stock_code, start_date, end_date)
+    return broker_display_dataframe(raw["buy"]), broker_display_dataframe(raw["sell"])
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def get_latest_close(ticker: str) -> float | None:
+    try:
+        history = yf.Ticker(ticker).history(period="7d")
+    except Exception:
+        return None
+    if history.empty or "Close" not in history:
+        return None
+    return float(history["Close"].dropna().iloc[-1])
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_moneydj_broker_daily_history(stock_code: str, start_date: dt.date, end_date: dt.date) -> list[dict]:
+    if start_date > end_date:
+        start_date, end_date = end_date, start_date
+    records = []
+    for trade_date in iter_weekday_dates(start_date, end_date):
+        raw = fetch_moneydj_broker_trade_raw(stock_code, trade_date, trade_date)
+        if raw["buy"].empty and raw["sell"].empty:
+            continue
+        records.append({"date": trade_date, **raw})
+    return records
+
+
+def concentration_comment(percent: float | None) -> str:
+    if percent is None:
+        return "無法估算"
+    if percent >= 20:
+        return "高度集中，主力控盤味道重"
+    if percent >= 15:
+        return "偏集中，主力影響力明顯"
+    if percent >= 8:
+        return "有主力參與，但未達高度控盤"
+    return "籌碼較分散"
+
+
+def cost_margin_comment(margin_percent: float | None) -> str:
+    if margin_percent is None:
+        return "無法比較"
+    if margin_percent <= 0:
+        return "低於主力平均買超成本，安全邊際較高"
+    if margin_percent <= 3:
+        return "接近主力成本線，可觀察支撐"
+    return "高於主力成本線，追價風險較高"
+
+
+def build_broker_continuity_table(daily_records: list[dict]) -> pd.DataFrame:
+    dates = [record["date"] for record in daily_records]
+    broker_buy_map: dict[str, dict] = {}
+    for record in daily_records:
+        for row in record["buy"].to_dict("records"):
+            broker = row["券商分點"]
+            stats = broker_buy_map.setdefault(broker, {"總買超(張)": 0, "買超天數": 0, "dates": set()})
+            stats["總買超(張)"] += int(row["買賣超(張)"])
+            stats["買超天數"] += 1
+            stats["dates"].add(record["date"])
+
+    rows = []
+    for broker, stats in broker_buy_map.items():
+        streak = 0
+        for trade_date in reversed(dates):
+            if trade_date in stats["dates"]:
+                streak += 1
+            elif streak:
+                break
+        rows.append(
+            {
+                "券商分點": broker,
+                "最近連續買超天數": streak,
+                "區間買超天數": stats["買超天數"],
+                "區間合計買超(張)": stats["總買超(張)"],
+                "解讀": "波段吸籌觀察" if streak >= 3 else "短線觀察",
+            }
+        )
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows).sort_values(["最近連續買超天數", "區間合計買超(張)"], ascending=[False, False]).head(10)
+    df["區間合計買超(張)"] = df["區間合計買超(張)"].map(format_signed_number)
+    return df.reset_index(drop=True)
+
+
+def build_broker_inertia_table(daily_records: list[dict]) -> pd.DataFrame:
+    rows = []
+    sorted_records = sorted(daily_records, key=lambda item: item["date"])
+    for previous, current in zip(sorted_records, sorted_records[1:]):
+        previous_buys = {row["券商分點"]: int(row["買賣超(張)"]) for row in previous["buy"].to_dict("records")}
+        current_sells = {row["券商分點"]: abs(int(row["買賣超(張)"])) for row in current["sell"].to_dict("records")}
+        for broker, buy_lots in previous_buys.items():
+            sell_lots = current_sells.get(broker, 0)
+            if buy_lots >= 100 and sell_lots >= buy_lots * 0.6:
+                rows.append(
+                    {
+                        "券商分點": broker,
+                        "大買日期": previous["date"].strftime("%Y-%m-%d"),
+                        "隔日賣出日期": current["date"].strftime("%Y-%m-%d"),
+                        "前日買超(張)": buy_lots,
+                        "隔日賣超(張)": -sell_lots,
+                        "賣回比例": sell_lots / buy_lots,
+                    }
+                )
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows).sort_values("賣回比例", ascending=False).head(10)
+    df["前日買超(張)"] = df["前日買超(張)"].map(format_signed_number)
+    df["隔日賣超(張)"] = df["隔日賣超(張)"].map(format_signed_number)
+    df["賣回比例"] = df["賣回比例"].map(lambda value: f"{value:.0%}")
+    return df.reset_index(drop=True)
+
+
+def broker_tag(name: str) -> str:
+    foreign_keywords = ["摩根", "麥格理", "瑞銀", "大和", "法銀", "美林", "高盛", "花旗", "港商", "新加坡"]
+    if any(keyword in name for keyword in foreign_keywords):
+        return "外資券商"
+    if "-" in name:
+        return "分公司分點"
+    return "本土券商"
+
+
+def build_winner_loser_table(buy_df: pd.DataFrame, sell_df: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    for label, frame in [("關鍵買方", buy_df.head(5)), ("關鍵賣方", sell_df.head(5))]:
+        for row in frame.to_dict("records"):
+            rows.append(
+                {
+                    "分類": label,
+                    "券商分點": row["券商分點"],
+                    "買賣超(張)": int(row["買賣超(張)"]),
+                    "券商屬性": broker_tag(row["券商分點"]),
+                    "觀察重點": "若連續買超，偏波段吸籌" if label == "關鍵買方" else "若連續賣超，偏籌碼壓力",
+                }
+            )
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    df["買賣超(張)"] = df["買賣超(張)"].map(format_signed_number)
+    return df
+
+
+def build_main_force_analysis(ticker: str, stock_code: str, start_date: dt.date, end_date: dt.date, top_n: int) -> dict:
+    raw = fetch_moneydj_broker_trade_raw(stock_code, start_date, end_date)
+    buy_df = raw["buy"]
+    sell_df = raw["sell"]
+    total_volume_lots = raw["total_volume_lots"]
+    top_buy_lots = int(buy_df.head(top_n)["買賣超(張)"].sum()) if not buy_df.empty else 0
+    concentration = (top_buy_lots / total_volume_lots * 100) if total_volume_lots else None
+
+    latest_close = get_latest_close(ticker)
+    avg_buy_cost = raw["avg_buy_cost"]
+    margin_percent = ((latest_close - avg_buy_cost) / avg_buy_cost * 100) if latest_close and avg_buy_cost else None
+    daily_records = fetch_moneydj_broker_daily_history(stock_code, start_date, end_date)
+
+    summary = pd.DataFrame(
+        [
+            {
+                "指標": f"買超集中度 Top {top_n}",
+                "數值": f"{concentration:.2f}%" if concentration is not None else "-",
+                "解讀": concentration_comment(concentration),
+            },
+            {
+                "指標": "Top N 合計買超",
+                "數值": f"{top_buy_lots:,} 張",
+                "解讀": "主力買方合計力道",
+            },
+            {
+                "指標": "區間成交量估算",
+                "數值": f"{total_volume_lots:,.0f} 張" if total_volume_lots else "-",
+                "解讀": "由分點佔成交比重反推",
+            },
+            {
+                "指標": "主力平均買超成本",
+                "數值": f"{avg_buy_cost:.2f}" if avg_buy_cost else "-",
+                "解讀": cost_margin_comment(margin_percent),
+            },
+            {
+                "指標": "最新收盤價 vs 成本線",
+                "數值": f"{margin_percent:+.2f}%" if margin_percent is not None else "-",
+                "解讀": "正值代表股價高於主力成本，負值代表低於主力成本",
+            },
+        ]
+    )
+    return {
+        "summary": summary,
+        "buy": broker_display_dataframe(buy_df),
+        "sell": broker_display_dataframe(sell_df),
+        "continuity": build_broker_continuity_table(daily_records),
+        "inertia": build_broker_inertia_table(daily_records),
+        "winner_loser": build_winner_loser_table(buy_df, sell_df),
+    }
+
+
 @st.cache_data(ttl=3600)
 def get_institutional_trade_data(ticker: str, trading_days: int = 10) -> pd.DataFrame:
     stock_code, market = get_stock_code_and_market(ticker)
@@ -2562,7 +3006,7 @@ def render_candlestick_teaching() -> None:
 
 def render_home() -> None:
     st.title("投資工具首頁")
-    st.caption("這支程式同時包含 K 線型態分析、K 線型態教學、權證計算機、權證推薦與主動 ETF 持股追蹤，之後可直接部署到 GitHub 與 Streamlit Community Cloud。")
+    st.caption("這支程式同時包含 K 線型態分析、K 線型態教學、權證計算機、權證推薦、主動 ETF 持股追蹤與籌碼分析，之後可直接部署到 GitHub 與 Streamlit Community Cloud。")
     kline_left, kline_right = st.columns(2)
     with kline_left:
         st.markdown("### K線型態分析")
@@ -2596,7 +3040,10 @@ def render_home() -> None:
         if st.button("前往 主動ETF追蹤", type="primary", use_container_width=True):
             go_to("active_etf")
     with etf_right:
-        st.write("")
+        st.markdown("### 籌碼分析工具")
+        st.write("查詢個股或大盤三大法人買賣超，並用表格整理籌碼狀態。")
+        if st.button("前往 籌碼分析工具", type="primary", use_container_width=True):
+            go_to("chip_analysis")
 
 
 def render_warrant_calculator() -> None:
@@ -3037,6 +3484,93 @@ def render_active_etf_tracker() -> None:
             metric_cols[2].metric("歷史快照數", f"{len(history)}")
             st.dataframe(holdings_df, use_container_width=True, hide_index=True)
 
+
+def render_chip_analysis_tool() -> None:
+    st.title("籌碼分析工具")
+    st.caption("查詢個股或大盤三大法人買賣超；個股另提供主力券商分點買超 / 賣超前 10 大。")
+
+    today = dt.date.today()
+    default_start = today - dt.timedelta(days=7)
+    input_col, start_col, end_col, top_col = st.columns([0.34, 0.24, 0.24, 0.18])
+    with input_col:
+        query = st.text_input("股票代碼 / 名稱 / 大盤", value="3037", help="可輸入 3037、欣興、台半，或輸入 大盤 / market。")
+    with start_col:
+        start_date = st.date_input("起始日期", value=default_start)
+    with end_col:
+        end_date = st.date_input("結束日期", value=today)
+    with top_col:
+        top_n = st.number_input("集中度前N名", min_value=1, max_value=10, value=5, step=1)
+
+    if st.button("查詢籌碼", type="primary", use_container_width=True):
+        query_text = query.strip()
+        if not query_text:
+            st.warning("請輸入股票代碼、股票名稱或大盤。")
+            return
+
+        is_market = query_text.lower() in {"market", "m", "taiex"} or query_text in {"大盤", "加權"}
+        with st.spinner("正在查詢三大法人資料..."):
+            if is_market:
+                result_df = build_market_chip_rows(start_date, end_date)
+                resolved_label = "大盤"
+            else:
+                result_df, resolved_label = build_stock_chip_rows(query_text, start_date, end_date)
+
+        if result_df.empty:
+            st.warning("查詢區間內沒有找到可顯示的籌碼資料，可能為休市日、資料尚未更新，或市場別資料源暫時無回應。")
+            return
+
+        st.subheader(f"查詢結果：{resolved_label}")
+        st.dataframe(result_df, use_container_width=True, hide_index=True)
+
+        if not is_market:
+            stock_code, _ = get_stock_code_and_market(resolved_label)
+            st.subheader("主力買賣超")
+            st.caption("資料來源為公開券商分點進出明細，時間範圍沿用上方起訖日期；單位為張。")
+            with st.spinner("正在查詢主力券商分點買賣超..."):
+                try:
+                    analysis = build_main_force_analysis(resolved_label, stock_code, start_date, end_date, int(top_n))
+                except Exception as error:
+                    st.warning(f"主力買賣超查詢失敗：{error}")
+                    return
+
+            buy_col, sell_col = st.columns(2)
+            with buy_col:
+                st.markdown("#### 買超前 10 大")
+                if analysis["buy"].empty:
+                    st.info("查無買超分點資料。")
+                else:
+                    st.dataframe(analysis["buy"], use_container_width=True, hide_index=True)
+            with sell_col:
+                st.markdown("#### 賣超前 10 大")
+                if analysis["sell"].empty:
+                    st.info("查無賣超分點資料。")
+                else:
+                    st.dataframe(analysis["sell"], use_container_width=True, hide_index=True)
+
+            st.subheader("主力籌碼分析指標")
+            st.dataframe(analysis["summary"], use_container_width=True, hide_index=True)
+
+            continuity_col, inertia_col = st.columns(2)
+            with continuity_col:
+                st.markdown("#### 連續買超 / 波段吸籌")
+                if analysis["continuity"].empty:
+                    st.info("目前區間沒有足夠資料判斷連續買超。")
+                else:
+                    st.dataframe(analysis["continuity"], use_container_width=True, hide_index=True)
+            with inertia_col:
+                st.markdown("#### 隔日沖慣性")
+                if analysis["inertia"].empty:
+                    st.info("目前區間未偵測到明顯大買後隔日賣回。")
+                else:
+                    st.dataframe(analysis["inertia"], use_container_width=True, hide_index=True)
+
+            st.markdown("#### 贏家與輸家對分 / 多空對峙")
+            if analysis["winner_loser"].empty:
+                st.info("目前沒有足夠分點資料可做多空對分。")
+            else:
+                st.dataframe(analysis["winner_loser"], use_container_width=True, hide_index=True)
+            st.caption("提醒：分點不等於單一主力帳戶，同一券商也可能同時有不同投資人進出；這些指標適合用來輔助觀察籌碼力道，不宜單獨當成買賣依據。")
+
 # -----------------------------
 # 主介面
 # -----------------------------
@@ -3219,6 +3753,8 @@ def main():
         render_warrant_recommendation()
     elif current == "active_etf":
         render_active_etf_tracker()
+    elif current == "chip_analysis":
+        render_chip_analysis_tool()
     else:
         render_home()
 
