@@ -874,6 +874,10 @@ def format_signed_number(value: int | float) -> str:
     return f"+{value:,.0f}" if value > 0 else f"{value:,.0f}"
 
 
+def format_number(value: int | float) -> str:
+    return f"{value:,.0f}"
+
+
 def chip_status_from_lots(total_lots: int) -> str:
     if total_lots >= 5000:
         return "大幅買超"
@@ -968,6 +972,147 @@ def build_stock_chip_rows(query: str, start_date: dt.date, end_date: dt.date) ->
             }
         )
     return pd.DataFrame(rows), ticker
+
+
+def parse_margin_row(values: list, trade_date: dt.date, stock_code: str, market: str) -> dict | None:
+    if len(values) < 13 or str(values[0]).strip() != stock_code:
+        return None
+
+    if market == "TPEX":
+        if len(values) < 15:
+            return None
+        margin_prev = parse_int(values[2])
+        margin_buy = parse_int(values[3])
+        margin_sell = parse_int(values[4])
+        margin_repay = parse_int(values[5])
+        margin_balance = parse_int(values[6])
+        short_prev = parse_int(values[10])
+        short_sell = parse_int(values[11])
+        short_buy = parse_int(values[12])
+        short_repay = parse_int(values[13])
+        short_balance = parse_int(values[14])
+    else:
+        margin_buy = parse_int(values[2])
+        margin_sell = parse_int(values[3])
+        margin_repay = parse_int(values[4])
+        margin_prev = parse_int(values[5])
+        margin_balance = parse_int(values[6])
+        short_buy = parse_int(values[8])
+        short_sell = parse_int(values[9])
+        short_repay = parse_int(values[10])
+        short_prev = parse_int(values[11])
+        short_balance = parse_int(values[12])
+    margin_change = margin_balance - margin_prev
+    short_change = short_balance - short_prev
+    short_margin_ratio = (short_balance / margin_balance * 100) if margin_balance else 0
+
+    if margin_change > 0 and short_change <= 0:
+        signal = "融資增加、融券未同步增加，偏多但需留意散戶追價"
+    elif margin_change < 0 and short_change > 0:
+        signal = "融資減少、融券增加，偏空或避險升溫"
+    elif margin_change > 0 and short_change > 0:
+        signal = "資券同步增加，多空分歧升溫"
+    elif margin_change < 0 and short_change < 0:
+        signal = "資券同步減少，籌碼降溫"
+    else:
+        signal = "變化不明顯"
+
+    return {
+        "日期": trade_date.strftime("%Y-%m-%d"),
+        "代號": stock_code,
+        "市場": "上櫃" if market == "TPEX" else "上市",
+        "融資買進": margin_buy,
+        "融資賣出": margin_sell,
+        "融資現償": margin_repay,
+        "融資餘額": margin_balance,
+        "融資增減": margin_change,
+        "融券買進": short_buy,
+        "融券賣出": short_sell,
+        "融券現償": short_repay,
+        "融券餘額": short_balance,
+        "融券增減": short_change,
+        "券資比%": short_margin_ratio,
+        "解讀": signal,
+    }
+
+
+def twse_margin_rows(payload: dict) -> list:
+    if payload.get("data"):
+        return payload.get("data", [])
+    for table in payload.get("tables", []):
+        rows = table.get("data") or []
+        if rows and len(rows[0]) >= 13:
+            return rows
+    return []
+
+
+def fetch_twse_margin_trade(stock_code: str, trade_date: dt.date) -> dict | None:
+    url = (
+        "https://www.twse.com.tw/exchangeReport/MI_MARGN"
+        f"?response=json&date={trade_date.strftime('%Y%m%d')}&selectType=ALL"
+    )
+    payload = fetch_json(url)
+    if payload.get("stat") not in ("OK", None):
+        return None
+    for values in twse_margin_rows(payload):
+        record = parse_margin_row(values, trade_date, stock_code, "TWSE")
+        if record:
+            return record
+    return None
+
+
+def fetch_tpex_margin_trade(stock_code: str, trade_date: dt.date) -> dict | None:
+    csv_url = (
+        "https://www.tpex.org.tw/web/stock/margin_trading/margin_balance/margin_bal_result.php"
+        f"?l=zh-tw&o=csv&d={format_roc_date(trade_date)}&s=0,asc"
+    )
+    csv_text = fetch_text(csv_url)
+    lines = [
+        row
+        for row in csv.reader(io.StringIO(csv_text))
+        if row and not row[0].startswith("=") and not row[0].startswith("資料")
+    ]
+    for values in lines:
+        record = parse_margin_row(values, trade_date, stock_code, "TPEX")
+        if record:
+            return record
+    return None
+
+
+def build_margin_trade_rows(query: str, start_date: dt.date, end_date: dt.date) -> pd.DataFrame:
+    ticker = normalize_ticker(query)
+    stock_code, market = get_stock_code_and_market(ticker)
+    rows = []
+    for trade_date in iter_weekday_dates(start_date, end_date):
+        try:
+            record = (
+                fetch_tpex_margin_trade(stock_code, trade_date)
+                if market == "TPEX"
+                else fetch_twse_margin_trade(stock_code, trade_date)
+            )
+        except Exception:
+            record = None
+        if record:
+            rows.append(record)
+
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows).sort_values("日期", ascending=False)
+    for column in [
+        "融資買進",
+        "融資賣出",
+        "融資現償",
+        "融資餘額",
+        "融券買進",
+        "融券賣出",
+        "融券現償",
+        "融券餘額",
+    ]:
+        df[column] = df[column].map(format_number)
+    for column in ["融資增減", "融券增減"]:
+        df[column] = df[column].map(format_signed_number)
+    df["券資比%"] = df["券資比%"].map(lambda value: f"{value:.2f}%")
+    return df.reset_index(drop=True)
 
 
 def build_market_chip_rows(start_date: dt.date, end_date: dt.date) -> pd.DataFrame:
@@ -3524,6 +3669,15 @@ def render_chip_analysis_tool() -> None:
 
         if not is_market:
             stock_code, _ = get_stock_code_and_market(resolved_label)
+            st.subheader("融資融券變化")
+            st.caption("日期範圍沿用上方三大法人查詢區間；單位為張，券資比為融券餘額 / 融資餘額。")
+            with st.spinner("正在查詢融資融券資料..."):
+                margin_df = build_margin_trade_rows(resolved_label, start_date, end_date)
+            if margin_df.empty:
+                st.info("查詢區間內沒有找到融資融券資料，可能為休市日、資料尚未更新，或該股票未開放信用交易。")
+            else:
+                st.dataframe(margin_df, use_container_width=True, hide_index=True)
+
             st.subheader("主力買賣超")
             st.caption("資料來源為公開券商分點進出明細，時間範圍沿用上方起訖日期；單位為張。")
             with st.spinner("正在查詢主力券商分點買賣超..."):
