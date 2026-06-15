@@ -2607,7 +2607,7 @@ def clear_recommendation_state() -> None:
     st.session_state["recommend_rows"] = None
 
 
-RECOMMENDATION_STYLE_OPTIONS = ["偏保守", "偏均衡", "偏積極", "偏高流動性", "傑夫林喜好", "自訂條件"]
+RECOMMENDATION_STYLE_OPTIONS = ["偏保守", "偏均衡", "偏積極", "偏高流動性", "傑夫林喜好", "權證小哥風格", "自訂條件"]
 
 
 def recommendation_style_description(style: str) -> str:
@@ -2617,6 +2617,7 @@ def recommendation_style_description(style: str) -> str:
         "偏積極": "偏向高槓桿與高行使比例，追求標的上漲時的彈性，但容忍較高波動成本與價差。",
         "偏高流動性": "優先看成交量、買賣價差比與進出場摩擦，適合重視能不能順利買賣的人。",
         "傑夫林喜好": "主打 360 天以上、大槓桿、成交量要夠：要求剩餘天數至少 360 天、實質槓桿超過 5、成交量至少 500，並避免價差與 BIV/SIV gap 過度失控。",
+        "權證小哥風格": "偏短線交易思維：先看標的動能與權證流動性，成交量、雙邊報價、價差與 BIV/SIV gap 要合理，再挑中高槓桿與不要過度深價外的標的。",
         "自訂條件": "由你自行設定最低剩餘天數、行使比例、實質槓桿與成交量，排序則用均衡邏輯處理。",
     }
     return descriptions.get(style, descriptions["偏均衡"])
@@ -2688,6 +2689,27 @@ def score_recommendation(row: dict, style: str) -> float:
     in_out_abs = abs(safe_float(row.get("IN_OUT_PERCENT")))
     outstanding = safe_float(row.get("OUTSTANDING_PERCENT"))
     price = safe_float(row.get("DEAL"))
+
+    if style == "權證小哥風格":
+        score = 0.0
+        score += min(volume, 8000.0) / 12
+        score += min(leverage, 8.0) * 14
+        score += min(execrate, 0.02) * 2400
+        score += min(last_days, 540.0) / 16
+        score -= spread * 14
+        score -= gap * 8
+        score -= max(siv - 100.0, 0.0) * 0.9
+        score -= max(in_out_abs - 20.0, 0.0) * 1.2
+        score -= max(outstanding - 80.0, 0.0) * 0.45
+        if volume < 100:
+            score -= 70
+        if spread > 5:
+            score -= 50
+        if gap > 12:
+            score -= 45
+        if price <= 0:
+            score -= 60
+        return score
 
     if style == "傑夫林喜好":
         score = 0.0
@@ -2788,6 +2810,8 @@ def recommendation_reason(row: dict, style: str) -> str:
         notes.append("流動性排序")
     elif style == "傑夫林喜好":
         notes.append("大槓桿短線排序")
+    elif style == "權證小哥風格":
+        notes.append("動能流動性排序")
     else:
         notes.append("均衡排序")
     return "、".join(notes) if notes else "條件均衡"
@@ -2845,6 +2869,13 @@ def recommendation_thresholds(style: str) -> dict:
             "execrate_min": 0.005,
             "leverage_min": 5.0,
             "volume_min": 500.0,
+        }
+    if style == "權證小哥風格":
+        return {
+            "last_days_from": 180,
+            "execrate_min": 0.005,
+            "leverage_min": 2.5,
+            "volume_min": 100.0,
         }
     return {
         "last_days_from": 360,
@@ -3425,7 +3456,7 @@ def render_warrant_recommendation() -> None:
         RECOMMENDATION_STYLE_OPTIONS,
         index=RECOMMENDATION_STYLE_OPTIONS.index(current_style),
         horizontal=True,
-        help="偏保守重視成本與風險，偏均衡平衡槓桿與流動性，偏積極強調槓桿與行使比例，偏高流動性優先看量與價差，傑夫林喜好主打 360 天以上、大槓桿、成交量要夠。",
+        help="偏保守重視成本與風險，偏均衡平衡槓桿與流動性，偏積極強調槓桿與行使比例，偏高流動性優先看量與價差，傑夫林喜好主打 360 天以上、大槓桿、成交量要夠，權證小哥風格偏短線動能與報價品質。",
     )
     st.session_state["recommend_style"] = style
     st.info(recommendation_style_description(style))
@@ -3518,6 +3549,8 @@ def render_warrant_recommendation() -> None:
         st.write("目前使用高流動性排序：優先看成交量、買賣價差比與較小的 BIV/SIV gap，降低進出場摩擦。")
     elif style == "傑夫林喜好":
         st.write("目前使用傑夫林喜好排序：360 天以上、大槓桿超過 5、成交量要夠；同時避免價差與 BIV/SIV gap 過度失控。")
+    elif style == "權證小哥風格":
+        st.write("目前使用權證小哥風格排序：先抓成交量、雙邊報價與價差，再看槓桿、BIV/SIV gap、SIV 成本與價內外程度，偏向短線強勢標的的可交易權證。")
     elif style == "自訂條件":
         st.write(
             "目前使用自訂條件："
