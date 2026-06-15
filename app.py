@@ -1443,6 +1443,136 @@ def build_main_force_analysis(ticker: str, stock_code: str, start_date: dt.date,
     }
 
 
+def numeric_chart_frame(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
+    chart_df = df.copy()
+    for column in columns:
+        if column in chart_df.columns:
+            chart_df[column] = chart_df[column].map(parse_numeric_text)
+    if "日期" in chart_df.columns:
+        chart_df["日期"] = pd.to_datetime(chart_df["日期"], errors="coerce")
+        chart_df = chart_df.sort_values("日期")
+    return chart_df
+
+
+def broker_chart_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    chart_df = frame.copy()
+    if chart_df.empty:
+        return chart_df
+    for column in ["買進(張)", "賣出(張)", "買賣超(張)"]:
+        if column in chart_df.columns:
+            chart_df[column] = chart_df[column].map(parse_numeric_text)
+    chart_df["顏色"] = chart_df["買賣超(張)"].map(lambda value: "#d83a3a" if value >= 0 else "#1f8a4c")
+    return chart_df
+
+
+def render_institutional_chart(chip_df: pd.DataFrame, title: str) -> None:
+    if chip_df.empty:
+        return
+
+    value_columns = [column for column in ["外資買賣超(張)", "投信買賣超(張)", "自營商買賣超(張)", "三大合計(張)"] if column in chip_df.columns]
+    if not value_columns:
+        value_columns = [column for column in ["外資買賣超(億元)", "投信買賣超(億元)", "自營商買賣超(億元)", "三大合計(億元)"] if column in chip_df.columns]
+    if not value_columns:
+        return
+
+    chart_df = numeric_chart_frame(chip_df, value_columns)
+    unit = "張" if value_columns[0].endswith("(張)") else "億元"
+    fig = go.Figure()
+    bar_columns = [column for column in value_columns if not column.startswith("三大合計")]
+    colors = {
+        "外資買賣超(張)": "#3867d6",
+        "投信買賣超(張)": "#f7b731",
+        "自營商買賣超(張)": "#8854d0",
+        "外資買賣超(億元)": "#3867d6",
+        "投信買賣超(億元)": "#f7b731",
+        "自營商買賣超(億元)": "#8854d0",
+    }
+    for column in bar_columns:
+        fig.add_bar(x=chart_df["日期"], y=chart_df[column], name=column.replace(f"({unit})", ""), marker_color=colors.get(column))
+
+    total_column = next((column for column in value_columns if column.startswith("三大合計")), None)
+    if total_column:
+        fig.add_trace(
+            go.Scatter(
+                x=chart_df["日期"],
+                y=chart_df[total_column],
+                name="三大合計",
+                mode="lines+markers",
+                line=dict(color="#222f3e", width=3),
+            )
+        )
+
+    fig.add_hline(y=0, line_color="#95a5a6", line_width=1)
+    fig.update_layout(
+        title=title,
+        barmode="relative",
+        height=360,
+        margin=dict(l=20, r=20, t=55, b=35),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+        yaxis_title=unit,
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def render_margin_chart(margin_df: pd.DataFrame) -> None:
+    if margin_df.empty:
+        return
+
+    chart_df = numeric_chart_frame(margin_df, ["融資增減", "融券增減", "融資餘額", "融券餘額", "券資比%"])
+    fig = make_subplots(
+        rows=2,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.1,
+        subplot_titles=("融資 / 融券每日增減", "融資餘額、融券餘額與券資比"),
+        specs=[[{"secondary_y": False}], [{"secondary_y": True}]],
+    )
+    fig.add_bar(x=chart_df["日期"], y=chart_df["融資增減"], name="融資增減", marker_color="#d83a3a", row=1, col=1)
+    fig.add_bar(x=chart_df["日期"], y=chart_df["融券增減"], name="融券增減", marker_color="#1f8a4c", row=1, col=1)
+    fig.add_trace(go.Scatter(x=chart_df["日期"], y=chart_df["融資餘額"], name="融資餘額", line=dict(color="#e17055", width=3)), row=2, col=1, secondary_y=False)
+    fig.add_trace(go.Scatter(x=chart_df["日期"], y=chart_df["融券餘額"], name="融券餘額", line=dict(color="#00b894", width=3)), row=2, col=1, secondary_y=False)
+    fig.add_trace(go.Scatter(x=chart_df["日期"], y=chart_df["券資比%"], name="券資比%", line=dict(color="#2d3436", dash="dot")), row=2, col=1, secondary_y=True)
+    fig.add_hline(y=0, line_color="#95a5a6", line_width=1, row=1, col=1)
+    fig.update_layout(
+        height=520,
+        margin=dict(l=20, r=20, t=65, b=35),
+        barmode="relative",
+        legend=dict(orientation="h", yanchor="bottom", y=1.03, x=0),
+    )
+    fig.update_yaxes(title_text="增減張數", row=1, col=1)
+    fig.update_yaxes(title_text="餘額張數", row=2, col=1, secondary_y=False)
+    fig.update_yaxes(title_text="券資比%", row=2, col=1, secondary_y=True)
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def render_broker_chart(buy_df: pd.DataFrame, sell_df: pd.DataFrame) -> None:
+    combined = pd.concat([broker_chart_frame(buy_df), broker_chart_frame(sell_df)], ignore_index=True)
+    if combined.empty:
+        return
+    combined = combined.sort_values("買賣超(張)", ascending=True)
+    fig = go.Figure(
+        go.Bar(
+            x=combined["買賣超(張)"],
+            y=combined["券商分點"],
+            orientation="h",
+            marker_color=combined["顏色"],
+            text=combined["買賣超(張)"].map(lambda value: f"{value:+,.0f}"),
+            textposition="outside",
+            hovertemplate="%{y}<br>買賣超：%{x:,.0f} 張<extra></extra>",
+        )
+    )
+    fig.add_vline(x=0, line_color="#95a5a6", line_width=1)
+    fig.update_layout(
+        title="主力分點買賣超前 10 大",
+        height=max(420, len(combined) * 28),
+        margin=dict(l=20, r=70, t=55, b=35),
+        xaxis_title="買賣超張數",
+        yaxis_title="券商分點",
+        showlegend=False,
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
 @st.cache_data(ttl=3600)
 def get_institutional_trade_data(ticker: str, trading_days: int = 10) -> pd.DataFrame:
     stock_code, market = get_stock_code_and_market(ticker)
@@ -3715,10 +3845,10 @@ def render_active_etf_tracker() -> None:
 
 def render_chip_analysis_tool() -> None:
     st.title("籌碼分析工具")
-    st.caption("查詢個股或大盤三大法人買賣超；個股另提供主力券商分點買超 / 賣超前 10 大。")
+    st.caption("查詢個股或大盤三大法人買賣超；個股另提供融資融券變化與主力券商分點買超 / 賣超前 10 大。預設週期為近 10 天。")
 
     today = dt.date.today()
-    default_start = today - dt.timedelta(days=7)
+    default_start = today - dt.timedelta(days=10)
     input_col, start_col, end_col, top_col = st.columns([0.34, 0.24, 0.24, 0.18])
     with input_col:
         query = st.text_input("股票代碼 / 名稱 / 大盤", value="3037", help="可輸入 3037、欣興、台半，或輸入 大盤 / market。")
@@ -3749,6 +3879,8 @@ def render_chip_analysis_tool() -> None:
 
         st.subheader(f"查詢結果：{resolved_label}")
         st.dataframe(result_df, use_container_width=True, hide_index=True)
+        st.markdown("#### 三大法人圖表")
+        render_institutional_chart(result_df, f"{resolved_label} 三大法人買賣超趨勢")
 
         if not is_market:
             stock_code, _ = get_stock_code_and_market(resolved_label)
@@ -3760,6 +3892,8 @@ def render_chip_analysis_tool() -> None:
                 st.info("查詢區間內沒有找到融資融券資料，可能為休市日、資料尚未更新，或該股票未開放信用交易。")
             else:
                 st.dataframe(margin_df, use_container_width=True, hide_index=True)
+                st.markdown("#### 融資融券圖表")
+                render_margin_chart(margin_df)
 
             st.subheader("主力買賣超")
             st.caption("資料來源為公開券商分點進出明細，時間範圍沿用上方起訖日期；單位為張。")
@@ -3783,6 +3917,9 @@ def render_chip_analysis_tool() -> None:
                     st.info("查無賣超分點資料。")
                 else:
                     st.dataframe(analysis["sell"], use_container_width=True, hide_index=True)
+
+            st.markdown("#### 主力分點圖表")
+            render_broker_chart(analysis["buy"], analysis["sell"])
 
             st.subheader("主力籌碼分析指標")
             st.dataframe(analysis["summary"], use_container_width=True, hide_index=True)
