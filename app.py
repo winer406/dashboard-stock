@@ -1397,7 +1397,18 @@ def build_main_force_analysis(ticker: str, stock_code: str, start_date: dt.date,
     sell_df = raw["sell"]
     total_volume_lots = raw["total_volume_lots"]
     top_buy_lots = int(buy_df.head(top_n)["買賣超(張)"].sum()) if not buy_df.empty else 0
+    top_sell_lots = int(sell_df.head(top_n)["買賣超(張)"].sum()) if not sell_df.empty else 0
+    top_net_lots = top_buy_lots + top_sell_lots
     concentration = (top_buy_lots / total_volume_lots * 100) if total_volume_lots else None
+    net_ratio = (top_net_lots / total_volume_lots * 100) if total_volume_lots else None
+    if net_ratio is None:
+        main_force_direction = "無法判斷"
+    elif net_ratio >= 3:
+        main_force_direction = "主力偏買，短線籌碼偏多"
+    elif net_ratio <= -3:
+        main_force_direction = "主力偏賣，短線籌碼偏空"
+    else:
+        main_force_direction = "買賣力道接近，多空拉鋸"
 
     latest_close = get_latest_close(ticker)
     avg_buy_cost = raw["avg_buy_cost"]
@@ -1415,6 +1426,16 @@ def build_main_force_analysis(ticker: str, stock_code: str, start_date: dt.date,
                 "指標": "Top N 合計買超",
                 "數值": f"{top_buy_lots:,} 張",
                 "解讀": "主力買方合計力道",
+            },
+            {
+                "指標": "Top N 合計賣超",
+                "數值": f"{top_sell_lots:,} 張",
+                "解讀": "主力賣方合計力道",
+            },
+            {
+                "指標": "Top N 主力淨買賣超",
+                "數值": f"{top_net_lots:+,} 張",
+                "解讀": main_force_direction,
             },
             {
                 "指標": "區間成交量估算",
@@ -1520,28 +1541,57 @@ def render_margin_chart(margin_df: pd.DataFrame) -> None:
 
     chart_df = numeric_chart_frame(margin_df, ["融資增減", "融券增減", "融資餘額", "融券餘額", "券資比%"])
     fig = make_subplots(
-        rows=2,
+        rows=3,
         cols=1,
         shared_xaxes=True,
-        vertical_spacing=0.1,
-        subplot_titles=("融資 / 融券每日增減", "融資餘額、融券餘額與券資比"),
-        specs=[[{"secondary_y": False}], [{"secondary_y": True}]],
+        vertical_spacing=0.08,
+        row_heights=[0.36, 0.36, 0.28],
+        subplot_titles=("融資：每日增減與餘額", "融券：每日增減與餘額", "券資比"),
+        specs=[[{"secondary_y": True}], [{"secondary_y": True}], [{"secondary_y": False}]],
     )
-    fig.add_bar(x=chart_df["日期"], y=chart_df["融資增減"], name="融資增減", marker_color="#d83a3a", row=1, col=1)
-    fig.add_bar(x=chart_df["日期"], y=chart_df["融券增減"], name="融券增減", marker_color="#1f8a4c", row=1, col=1)
-    fig.add_trace(go.Scatter(x=chart_df["日期"], y=chart_df["融資餘額"], name="融資餘額", line=dict(color="#e17055", width=3)), row=2, col=1, secondary_y=False)
-    fig.add_trace(go.Scatter(x=chart_df["日期"], y=chart_df["融券餘額"], name="融券餘額", line=dict(color="#00b894", width=3)), row=2, col=1, secondary_y=False)
-    fig.add_trace(go.Scatter(x=chart_df["日期"], y=chart_df["券資比%"], name="券資比%", line=dict(color="#2d3436", dash="dot")), row=2, col=1, secondary_y=True)
+
+    margin_colors = chart_df["融資增減"].map(lambda value: "#d83a3a" if value >= 0 else "#1f8a4c")
+    short_colors = chart_df["融券增減"].map(lambda value: "#d83a3a" if value >= 0 else "#1f8a4c")
+    fig.add_bar(x=chart_df["日期"], y=chart_df["融資增減"], name="融資增減", marker_color=margin_colors, row=1, col=1, secondary_y=False)
+    fig.add_trace(
+        go.Scatter(x=chart_df["日期"], y=chart_df["融資餘額"], name="融資餘額", mode="lines+markers", line=dict(color="#8e1f1f", width=3)),
+        row=1,
+        col=1,
+        secondary_y=True,
+    )
+    fig.add_bar(x=chart_df["日期"], y=chart_df["融券增減"], name="融券增減", marker_color=short_colors, row=2, col=1, secondary_y=False)
+    fig.add_trace(
+        go.Scatter(x=chart_df["日期"], y=chart_df["融券餘額"], name="融券餘額", mode="lines+markers", line=dict(color="#0b6b3a", width=3)),
+        row=2,
+        col=1,
+        secondary_y=True,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=chart_df["日期"],
+            y=chart_df["券資比%"],
+            name="券資比%",
+            mode="lines+markers",
+            line=dict(color="#2d3436", width=3),
+            fill="tozeroy",
+            fillcolor="rgba(45, 52, 54, 0.10)",
+        ),
+        row=3,
+        col=1,
+    )
     fig.add_hline(y=0, line_color="#95a5a6", line_width=1, row=1, col=1)
+    fig.add_hline(y=0, line_color="#95a5a6", line_width=1, row=2, col=1)
     fig.update_layout(
-        height=520,
-        margin=dict(l=20, r=20, t=65, b=35),
-        barmode="relative",
+        height=720,
+        margin=dict(l=20, r=20, t=70, b=35),
+        barmode="overlay",
         legend=dict(orientation="h", yanchor="bottom", y=1.03, x=0),
     )
-    fig.update_yaxes(title_text="增減張數", row=1, col=1)
-    fig.update_yaxes(title_text="餘額張數", row=2, col=1, secondary_y=False)
-    fig.update_yaxes(title_text="券資比%", row=2, col=1, secondary_y=True)
+    fig.update_yaxes(title_text="增減", row=1, col=1, secondary_y=False)
+    fig.update_yaxes(title_text="餘額", row=1, col=1, secondary_y=True)
+    fig.update_yaxes(title_text="增減", row=2, col=1, secondary_y=False)
+    fig.update_yaxes(title_text="餘額", row=2, col=1, secondary_y=True)
+    fig.update_yaxes(title_text="券資比%", ticksuffix="%", row=3, col=1)
     st.plotly_chart(fig, use_container_width=True)
 
 
@@ -3922,6 +3972,7 @@ def render_chip_analysis_tool() -> None:
             render_broker_chart(analysis["buy"], analysis["sell"])
 
             st.subheader("主力籌碼分析指標")
+            st.caption("Top N 主力淨買賣超 = 買超前 N 大合計 + 賣超前 N 大合計；用來快速看主力分點短線偏買或偏賣。")
             st.dataframe(analysis["summary"], use_container_width=True, hide_index=True)
 
             continuity_col, inertia_col = st.columns(2)
