@@ -1214,37 +1214,75 @@ def broker_display_dataframe(frame: pd.DataFrame) -> pd.DataFrame:
     return display_df
 
 
+BROKER_COLUMNS = ["券商分點", "買進(張)", "賣出(張)", "買賣超(張)", "佔成交比重"]
+MONEYDJ_BROKER_SOURCES = [
+    ("富邦 eBrokerDJ", "https://fubon-ebrokerdj.fbs.com.tw/z/zc/zco/zco.djhtm"),
+    ("康和 MoneyDJ", "https://concords.moneydj.com/z/zc/zco/zco.djhtm"),
+    ("元大 MoneyDJ", "https://jdata.yuanta.com.tw/z/zc/zco/zco.djhtm"),
+]
+
+
+def parse_moneydj_broker_page(page_html: str) -> tuple[pd.DataFrame, pd.DataFrame, float | None, float | None]:
+    buy_rows = parse_broker_rows(page_html, "buy")
+    sell_rows = parse_broker_rows(page_html, "sell")
+    buy_df = pd.DataFrame(buy_rows, columns=BROKER_COLUMNS)
+    sell_df = pd.DataFrame(sell_rows, columns=BROKER_COLUMNS)
+    if not buy_df.empty:
+        buy_df = buy_df.sort_values("買賣超(張)", ascending=False).head(10).reset_index(drop=True)
+    if not sell_df.empty:
+        sell_df = sell_df.sort_values("買賣超(張)", ascending=True).head(10).reset_index(drop=True)
+    avg_buy_cost, avg_sell_cost = parse_moneydj_average_costs(page_html)
+    return buy_df, sell_df, avg_buy_cost, avg_sell_cost
+
+
+def request_moneydj_broker_page(source_url: str, params: dict) -> str:
+    url = source_url + "?" + urllib.parse.urlencode(params)
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0",
+            "Referer": source_url.split("/z/")[0] + "/",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=15, context=ssl._create_unverified_context()) as response:
+        return response.read().decode("big5", "ignore")
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_moneydj_broker_trade_raw(stock_code: str, start_date: dt.date, end_date: dt.date) -> dict:
     if start_date > end_date:
         start_date, end_date = end_date, start_date
 
-    params = {
+    interval_params = {
         "a": stock_code,
         "e": f"{start_date.year}-{start_date.month}-{start_date.day}",
         "f": f"{end_date.year}-{end_date.month}-{end_date.day}",
     }
-    url = "https://fubon-ebrokerdj.fbs.com.tw/z/zc/zco/zco.djhtm?" + urllib.parse.urlencode(params)
-    request = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": "Mozilla/5.0",
-            "Referer": "https://fubon-ebrokerdj.fbs.com.tw/",
-        },
-    )
-    with urllib.request.urlopen(request, timeout=20, context=ssl._create_unverified_context()) as response:
-        page_html = response.read().decode("big5", "ignore")
-
-    buy_df = pd.DataFrame(parse_broker_rows(page_html, "buy")).sort_values("買賣超(張)", ascending=False).head(10)
-    sell_df = pd.DataFrame(parse_broker_rows(page_html, "sell")).sort_values("買賣超(張)", ascending=True).head(10)
-    avg_buy_cost, avg_sell_cost = parse_moneydj_average_costs(page_html)
-    return {
-        "buy": buy_df.reset_index(drop=True),
-        "sell": sell_df.reset_index(drop=True),
-        "avg_buy_cost": avg_buy_cost,
-        "avg_sell_cost": avg_sell_cost,
-        "total_volume_lots": infer_total_volume_lots(buy_df, sell_df),
+    single_day_params = {
+        "a": stock_code,
+        "b": f"{end_date.year}-{end_date.month}-{end_date.day}",
     }
+    errors = []
+    for source_name, source_url in MONEYDJ_BROKER_SOURCES:
+        for query_name, params in [("區間", interval_params), ("截止日單日", single_day_params)]:
+            try:
+                page_html = request_moneydj_broker_page(source_url, params)
+                buy_df, sell_df, avg_buy_cost, avg_sell_cost = parse_moneydj_broker_page(page_html)
+                if buy_df.empty and sell_df.empty:
+                    errors.append(f"{source_name} {query_name}: 無分點資料")
+                    continue
+                return {
+                    "buy": buy_df,
+                    "sell": sell_df,
+                    "avg_buy_cost": avg_buy_cost,
+                    "avg_sell_cost": avg_sell_cost,
+                    "total_volume_lots": infer_total_volume_lots(buy_df, sell_df),
+                    "source": source_name,
+                    "query_mode": query_name,
+                }
+            except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+                errors.append(f"{source_name} {query_name}: {exception_message(exc)}")
+    raise RuntimeError("所有主力分點來源均無法取得資料；" + "；".join(errors[-6:]))
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -1270,7 +1308,10 @@ def fetch_moneydj_broker_daily_history(stock_code: str, start_date: dt.date, end
         start_date, end_date = end_date, start_date
     records = []
     for trade_date in iter_weekday_dates(start_date, end_date):
-        raw = fetch_moneydj_broker_trade_raw(stock_code, trade_date, trade_date)
+        try:
+            raw = fetch_moneydj_broker_trade_raw(stock_code, trade_date, trade_date)
+        except (RuntimeError, urllib.error.URLError, TimeoutError, OSError, ValueError):
+            continue
         if raw["buy"].empty and raw["sell"].empty:
             continue
         records.append({"date": trade_date, **raw})
@@ -1461,6 +1502,8 @@ def build_main_force_analysis(ticker: str, stock_code: str, start_date: dt.date,
         "continuity": build_broker_continuity_table(daily_records),
         "inertia": build_broker_inertia_table(daily_records),
         "winner_loser": build_winner_loser_table(buy_df, sell_df),
+        "source": raw.get("source", "MoneyDJ"),
+        "query_mode": raw.get("query_mode", "區間"),
     }
 
 
@@ -2766,6 +2809,7 @@ def init_home_state() -> None:
     st.session_state.setdefault("recommend_custom_execrate", 0.005)
     st.session_state.setdefault("recommend_custom_leverage", 2.0)
     st.session_state.setdefault("recommend_custom_volume", 100.0)
+    st.session_state.setdefault("broker_analysis_cache", {})
     if "active_etf_state" not in st.session_state:
         st.session_state["active_etf_state"] = load_active_etf_state()
     st.session_state.setdefault("active_etf_new_code", "")
@@ -3950,9 +3994,17 @@ def render_chip_analysis_tool() -> None:
             with st.spinner("正在查詢主力券商分點買賣超..."):
                 try:
                     analysis = build_main_force_analysis(resolved_label, stock_code, start_date, end_date, int(top_n))
+                    st.session_state["broker_analysis_cache"][stock_code] = analysis
                 except Exception as error:
-                    st.warning(f"主力買賣超查詢失敗：{error}")
-                    return
+                    cached_analysis = st.session_state.get("broker_analysis_cache", {}).get(stock_code)
+                    if cached_analysis:
+                        analysis = cached_analysis
+                        st.warning("即時主力買賣超來源暫時無法使用，目前顯示本次 session 最近一次成功資料。")
+                    else:
+                        st.warning(f"主力買賣超目前無法取得：{exception_message(error)}。已嘗試多個 MoneyDJ 鏡像與截止日單日備援，請稍後再試。")
+                        return
+
+            st.caption(f"本次主力分點來源：{analysis.get('source', 'MoneyDJ')}／查詢模式：{analysis.get('query_mode', '區間')}")
 
             buy_col, sell_col = st.columns(2)
             with buy_col:
